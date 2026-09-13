@@ -57,6 +57,10 @@ def _apply_cli_overrides(cfg: StreamConfig, args: argparse.Namespace) -> StreamC
         cfg.lid_lock = False
     if getattr(args, "keep_lock", False):
         cfg.unlock_on_utterance = False
+    if getattr(args, "no_sound_gate", False):
+        cfg.sound_gate = False
+    if getattr(args, "sound_gate_conf", None) is not None:
+        cfg.sound_gate_min_conf = float(args.sound_gate_conf)
     return cfg
 
 
@@ -249,6 +253,17 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--no-vad", action="store_true")
         sp.add_argument("--vad", action="store_true")
         sp.add_argument("--no-token-stream", action="store_true")
+        sp.add_argument(
+            "--no-sound-gate",
+            action="store_true",
+            help="Disable speech vs non-speech heuristic (send everything to ASR)",
+        )
+        sp.add_argument(
+            "--sound-gate-conf",
+            type=float,
+            default=None,
+            help="Min confidence 0..1 to skip ASR on non-speech (default 0.50)",
+        )
 
     m = sub.add_parser("mic", help="Stream from the Windows microphone")
     add_stream_flags(m)

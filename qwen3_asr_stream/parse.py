@@ -214,6 +214,35 @@ def parse_asr_output(raw: str, user_language: Optional[str] = None) -> tuple[str
     return lang, s.strip()
 
 
+# ASR often maps coughs / bursts to onomatopoeia (especially Chinese 咳咳咳).
+_EVENT_CJK = re.compile(r"^[\s。．，、！？咳嗯呵啊呃哈]+(?:[\s。．，、！？]+)?$")
+_EVENT_EN = re.compile(
+    r"^[\s\*]*(?:cough|ahem|achoo|hachoo|sneeze|sniff)(?:[\s\*.,!?]+(?:cough|ahem|achoo|hachoo|sneeze|sniff))*[\s\*.,!?]*$",
+    re.I,
+)
+
+
+def classify_sound_event_text(text: str) -> Optional[str]:
+    """Return a short event label when ASR output is non-lexical sound, not speech."""
+    t = (text or "").strip()
+    if not t:
+        return None
+    if t.count("咳") >= 1:
+        return "batuk?"
+    if _EVENT_EN.fullmatch(t):
+        return "batuk / bersin?"
+    core = re.sub(r"[\s。．，、！？\.,!?\-\*]+", "", t)
+    if not core:
+        return None
+    if len(core) <= 10 and all(c == "咳" for c in core):
+        return "batuk?"
+    if _EVENT_CJK.fullmatch(t):
+        return "suara non-bicara?"
+    if len(core) <= 8 and len(set(core)) <= 2 and all("\u4e00" <= c <= "\u9fff" for c in core):
+        return "suara non-bicara?"
+    return None
+
+
 def merge_languages(langs: list[str]) -> str:
     out: list[str] = []
     prev = None

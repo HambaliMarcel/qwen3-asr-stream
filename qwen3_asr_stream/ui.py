@@ -210,7 +210,10 @@ class LiveTranscript:
 
             _, clean = strip_asr_markup(st.finalized)
             self._last_result = clean
-            self._last_lang = st.language or self._last_lang
+            if clean.startswith("[") and clean.endswith("]"):
+                self._last_lang = ""
+            else:
+                self._last_lang = st.language or self._last_lang
             st.finalized = ""
             self._prev_unfixed = ""
             self._force = True
@@ -259,6 +262,9 @@ class LiveTranscript:
         if st.decoding:
             status = f"{YELLOW_B}{BOLD} DECODING {RESET}"
             hint = "model is writing words"
+        elif getattr(st, "non_speech_only", False) and getattr(st, "sound_label", ""):
+            status = f"{MAGENTA}{BOLD} NON-SPEECH {RESET}"
+            hint = f"heuristic: {st.sound_label} · ASR skipped"
         elif st.speaking or st.speech_seen:
             status = f"{GREEN_B}{BOLD} SPEAKING {RESET}"
             hint = "live words can still revise"
@@ -282,6 +288,8 @@ class LiveTranscript:
             lang = f"{YELLOW_B}CONFIRM{RESET} {WHITE}{votes}{RESET}"
         elif lid == "guessing":
             lang = f"{YELLOW}LID{RESET} {WHITE}{shown}{RESET}"
+        elif lid == "non-speech":
+            lang = f"{MAGENTA}SOUND{RESET} {WHITE}{getattr(st, 'sound_label', '') or 'non-bicara'}{RESET}"
         else:
             have = st.audio_accum.size / 16000.0
             lang = f"{CYAN}MIX{RESET} {WHITE}{shown}{RESET} {GRAY}{have:.1f}s{RESET}"
