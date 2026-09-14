@@ -228,6 +228,8 @@ class LiveTranscript:
             st.speaking,
             st.lid_rounds,
             st.refining,
+            getattr(st, "event_label", ""),
+            getattr(st, "non_speech_only", False),
             tuple(st.utterance_langs),
         ) != getattr(self, "_sig", None)
         self._sig = (
@@ -239,6 +241,8 @@ class LiveTranscript:
             st.speaking,
             st.lid_rounds,
             st.refining,
+            getattr(st, "event_label", ""),
+            getattr(st, "non_speech_only", False),
             tuple(st.utterance_langs),
         )
         if not self._force and not text_changed and (now - self._last_draw) < 0.07:
