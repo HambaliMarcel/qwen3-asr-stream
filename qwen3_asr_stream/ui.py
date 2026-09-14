@@ -268,10 +268,11 @@ class LiveTranscript:
             hint = "model is writing words"
         elif getattr(st, "non_speech_only", False) and getattr(st, "sound_label", ""):
             status = f"{MAGENTA}{BOLD} NON-SPEECH {RESET}"
-            hint = f"heuristic: {st.sound_label} · ASR skipped"
+            hint = f"{st.sound_label} · no speech detected"
         elif st.speaking or st.speech_seen:
             status = f"{GREEN_B}{BOLD} SPEAKING {RESET}"
-            hint = "live words can still revise"
+            ev = getattr(st, "event_label", "")
+            hint = f"live words can still revise · [{ev}]" if ev else "live words can still revise"
         else:
             status = f"{CYAN}{BOLD} LISTENING {RESET}"
             hint = "LIVE is draft · LAST is a full mixed-language pass"
@@ -293,7 +294,11 @@ class LiveTranscript:
         elif lid == "guessing":
             lang = f"{YELLOW}LID{RESET} {WHITE}{shown}{RESET}"
         elif lid == "non-speech":
-            lang = f"{MAGENTA}SOUND{RESET} {WHITE}{getattr(st, 'sound_label', '') or 'non-bicara'}{RESET}"
+            ev = getattr(st, "event_label", "") or getattr(st, "sound_label", "") or "non-bicara"
+            lang = f"{MAGENTA}SOUND{RESET} {WHITE}{ev}{RESET}"
+        elif getattr(st, "event_label", ""):
+            ev = st.event_label
+            lang = f"{MAGENTA}EVENT{RESET} {WHITE}{ev}{RESET}  {CYAN}MIX{RESET} {WHITE}{shown}{RESET}"
         else:
             have = st.audio_accum.size / 16000.0
             lang = f"{CYAN}MIX{RESET} {WHITE}{shown}{RESET} {GRAY}{have:.1f}s{RESET}"
