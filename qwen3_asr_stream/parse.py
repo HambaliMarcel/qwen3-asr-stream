@@ -222,6 +222,70 @@ _EVENT_EN = re.compile(
 )
 
 
+_LEXICAL_RE = re.compile(
+    r"[A-Za-zÀ-ÿ]{2,}|[\u4e00-\u9fff]{2,}|[\u3040-\u30ff]{2,}|[\uac00-\ud7af]{2,}|\d{2,}"
+)
+_ONOMATOPOEIA_CJK = frozenset("咳嗯呵啊呃哈")
+
+
+def _is_onomatopoeia_only(text: str) -> bool:
+    core = re.sub(r"[\s。．，、！？\.,!?\-\*]+", "", text or "")
+    if not core:
+        return True
+    if _EVENT_EN.fullmatch((text or "").strip()):
+        return True
+    return all(c in _ONOMATOPOEIA_CJK for c in core)
+
+
+def has_lexical_speech(text: str) -> bool:
+    """True when ASR output looks like real words, not only onomatopoeia."""
+    t = strip_event_prefix((text or "").strip())
+    if not t:
+        return False
+    if _is_onomatopoeia_only(t):
+        return False
+    event = classify_sound_event_text(t)
+    if event:
+        for run in re.findall(r"[\u4e00-\u9fff]+", t):
+            meaningful = [c for c in run if c not in _ONOMATOPOEIA_CJK]
+            if len(meaningful) >= 2:
+                return True
+        lowered = re.sub(
+            r"(?i)\b(?:cough|ahem|achoo|hachoo|sneeze|sniff)\b",
+            " ",
+            t,
+        )
+        if re.search(r"[A-Za-zÀ-ÿ]{2,}", lowered.strip()):
+            return True
+        return False
+    if re.search(r"[A-Za-zÀ-ÿ]{2,}", t):
+        return True
+    if re.search(r"[\u3040-\u30ff]{2,}|[\uac00-\ud7af]{2,}|\d{2,}", t):
+        return True
+    return bool(_LEXICAL_RE.search(t))
+
+
+def combine_event_and_transcript(event: str, text: str) -> str:
+    """Prefix companion event tag, keep full ASR text (e.g. music + lyrics)."""
+    ev = (event or "").strip()
+    body = (text or "").strip()
+    if not ev:
+        return body
+    if not body:
+        return f"[{ev}]"
+    if body.startswith("[") and "]" in body:
+        return body
+    return f"[{ev}] {body}"
+
+
+def strip_event_prefix(text: str) -> str:
+    t = (text or "").strip()
+    if t.startswith("[") and "]" in t:
+        _, _, rest = t.partition("]")
+        return rest.strip()
+    return t
+
+
 def classify_sound_event_text(text: str) -> Optional[str]:
     """Return a short event label when ASR output is non-lexical sound, not speech."""
     t = (text or "").strip()
