@@ -2,3 +2,5 @@
 # Install: pip install -r requirements-pann.txt
 torch>=2.0
 torchlibrosa>=0.1.0
+# Anti-aliased 16 kHz <-> 32 kHz resampling for the PANNs front-end.
+scipy>=1.10
