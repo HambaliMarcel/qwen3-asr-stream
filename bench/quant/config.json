@@ -1,0 +1,24 @@
+{
+  "comment": "Independent Q8_0 vs bf16 ASR bench. Does not touch production ports 9999/8080 or start-all.ps1.",
+  "llama_server": "C:\\AI\\llama.cpp\\llama-server.exe",
+  "mmproj": "C:\\AI\\models\\mmproj-Qwen3-ASR-1.7B-Q8_0.gguf",
+  "bench_host": "127.0.0.1",
+  "bench_port": 19999,
+  "ngl": 99,
+  "ctx": 4096,
+  "max_tokens": 128,
+  "temperature": 0.01,
+  "load_timeout_sec": 240,
+  "models": [
+    {
+      "id": "q8_0",
+      "label": "Qwen3-ASR-1.7B Q8_0",
+      "path": "C:\\AI\\models\\Qwen3-ASR-1.7B-Q8_0.gguf"
+    },
+    {
+      "id": "bf16",
+      "label": "Qwen3-ASR-1.7B bf16",
+      "path": "C:\\AI\\models\\Qwen3-ASR-1.7B-bf16.gguf"
+    }
+  ]
+}
