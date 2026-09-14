@@ -230,6 +230,7 @@ class LiveTranscript:
             st.refining,
             getattr(st, "event_label", ""),
             getattr(st, "non_speech_only", False),
+            getattr(st, "adapt_hint", ""),
             tuple(st.utterance_langs),
         ) != getattr(self, "_sig", None)
         self._sig = (
@@ -243,6 +244,7 @@ class LiveTranscript:
             st.refining,
             getattr(st, "event_label", ""),
             getattr(st, "non_speech_only", False),
+            getattr(st, "adapt_hint", ""),
             tuple(st.utterance_langs),
         )
         if not self._force and not text_changed and (now - self._last_draw) < 0.07:
@@ -275,13 +277,13 @@ class LiveTranscript:
             hint = f"live words can still revise · [{ev}]" if ev else "live words can still revise"
         else:
             status = f"{CYAN}{BOLD} LISTENING {RESET}"
-            hint = "LIVE is draft · LAST is a full mixed-language pass"
+            hint = "LIVE is draft · LAST shows at pause, last words catch up fast"
 
         lid = st.language_status
         mix = merge_languages(st.utterance_langs) if st.utterance_langs else (st.language or "")
         shown = mix or st.locked_language or st.language or "—"
         if getattr(st, "refining", False) or lid == "refining":
-            lang = f"{YELLOW_B}REFINE{RESET} {WHITE}{shown}{RESET}"
+            lang = f"{YELLOW_B}SEAL{RESET} {WHITE}{shown}{RESET}"
         elif lid == "forced":
             lang = f"{GREEN_B}LOCKED{RESET} {WHITE}{shown}{RESET} {GRAY}(forced){RESET}"
         elif lid == "locked":
@@ -300,19 +302,21 @@ class LiveTranscript:
             ev = st.event_label
             lang = f"{MAGENTA}EVENT{RESET} {WHITE}{ev}{RESET}  {CYAN}MIX{RESET} {WHITE}{shown}{RESET}"
         else:
-            have = st.audio_accum.size / 16000.0
-            lang = f"{CYAN}MIX{RESET} {WHITE}{shown}{RESET} {GRAY}{have:.1f}s{RESET}"
+            lang = f"{CYAN}MIX{RESET} {WHITE}{shown}{RESET}"
         seen = ", ".join(st.languages_seen[-5:]) if st.languages_seen else "Indo+English+… in one line"
-        hop = f"{int(st.cfg.hop_sec * 1000)}ms"
+        hop_sec = getattr(st, "tune_hop_sec", 0.0) or st.cfg.hop_sec
+        hop = f"{int(hop_sec * 1000)}ms"
         lat = f"{st.last.latency_ms:.0f}ms" if st.last else "—"
         rtf = f"{st.last.rtf:.2f}×" if st.last else "—"
-        win = f"{st.last.audio_sec:.1f}s" if st.last else "0.0s"
+        acc = f"{st.audio_accum.size / 16000.0:.1f}s"
+        dec = f"{st.last.audio_sec:.1f}s" if st.last else "—"
 
         top = (
             f" {status}  {lang}   {GRAY}hop{RESET} {WHITE}{hop}{RESET}  "
             f"{GRAY}decode{RESET} {WHITE}{lat}{RESET}  "
             f"{GRAY}rtf{RESET} {WHITE}{rtf}{RESET}  "
-            f"{GRAY}win{RESET} {WHITE}{win}{RESET}"
+            f"{GRAY}acc{RESET} {WHITE}{acc}{RESET}  "
+            f"{GRAY}dec{RESET} {WHITE}{dec}{RESET}"
         )
         meter = _meter(st.level, 18)
         live_painted = _paint_words(stable, live)
@@ -335,19 +339,26 @@ class LiveTranscript:
         if not self._last_result:
             last_lines = _wrap_ansi(last_body, inner - 2, 3)
 
+        adapt = getattr(st, "adapt_hint", "")
+        adapt_s = f"   {GRAY}{adapt}{RESET}" if adapt else ""
+        pause = getattr(st, "tune_pause_sec", 0.0) or st.cfg.silence_commit_sec
         out: list[str] = [
             f"{BOLD}{CYAN_B}  {self._title}{RESET}",
             box_top("SESSION"),
             row(top),
-            row(f" {meter}  {GRAY}{hint}{RESET}   {GRAY}heard:{RESET} {WHITE}{seen}{RESET}"),
+            row(f" {meter}  {GRAY}{hint}{RESET}{adapt_s}   {GRAY}heard:{RESET} {WHITE}{seen}{RESET}"),
             box_bot(),
             box_top("LIVE  ·  draft mix"),
             *[row(" " + line) for line in live_lines],
             box_bot(),
-            box_top(f"LAST  ·  refined  {last_lang or 'mix'}"),
+            box_top(
+                "LAST  ·  sealing"
+                if getattr(st, "refining", False)
+                else f"LAST  ·  {last_lang or 'mix'}"
+            ),
             *[row(" " + (f"{GREEN}{line}{RESET}" if self._last_result else line)) for line in last_lines],
             box_bot(),
-            f" {GRAY}Ctrl+C stop{RESET}   {GRAY}speak campur Indo/English in one sentence · pause to refine LAST{RESET}",
+            f" {GRAY}Ctrl+C stop{RESET}   {GRAY}pause ~{pause:.1f}s to commit · LAST is the live line, tail seals in the background{RESET}",
         ]
         self._rows = len(out)
         sys.stdout.write(HOME + CLEAR)
