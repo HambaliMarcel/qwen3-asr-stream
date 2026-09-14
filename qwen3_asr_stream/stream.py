@@ -306,36 +306,95 @@ class StreamingAsr:
         self._emit()
         return sealed
 
-    def _non_speech_label(
+    def _init_pann(self):
+        mode = (self.cfg.sound_model or "auto").strip().lower()
+        if mode in ("off", "heuristic"):
+            return None
+        from .pann_cnn6 import get_tagger, pann_available
+
+        if mode in ("auto", "pann", "pann_cnn6", "cnn6") and pann_available():
+            return get_tagger(
+                min_score=self.cfg.pann_min_score,
+                block_score=self.cfg.pann_block_score,
+                companion_score=self.cfg.pann_companion_score,
+                speech_score=self.cfg.pann_speech_score,
+            )
+        return None
+
+    def _maybe_pann_tag(self, audio: np.ndarray):
+        if self._pann is None:
+            return None
+        st = self.state
+        sec = audio.size / float(SAMPLE_RATE)
+        if sec < 0.8:
+            return None
+        if (
+            st.pann_cached is not None
+            and sec - st.pann_last_sec < self.cfg.pann_interval_sec
+        ):
+            return st.pann_cached
+        tag = self._pann.tag(audio)
+        st.pann_last_sec = sec
+        st.pann_cached = tag
+        if tag is not None:
+            st.event_label = tag.label
+            st.event_score = tag.score
+            st.event_top = tag.top_labels
+        return tag
+
+    def _refresh_event_tag(self, audio: np.ndarray) -> None:
+        tag = self._maybe_pann_tag(audio)
+        if tag is None or not tag.label:
+            return
+        st = self.state
+        st.event_label = tag.label
+        st.event_score = tag.score
+        st.event_top = tag.top_labels
+
+    def _with_event(self, text: str) -> str:
+        st = self.state
+        body = strip_event_prefix(text)
+        if has_lexical_speech(body) and st.event_label:
+            return combine_event_and_transcript(st.event_label, body)
+        if body:
+            return body
+        if st.event_label:
+            return f"[{st.event_label}]"
+        return text
+
+    def _should_block_asr_only(
         self,
         audio: np.ndarray,
         text: str,
         hint: Optional[SoundHint],
     ) -> Optional[str]:
+        """Block ASR only for pure non-speech (cough/clap), never when lyrics exist."""
+        if has_lexical_speech(text):
+            return None
+        onom = classify_sound_event_text(text)
+        if onom:
+            return onom
+        tag = self._maybe_pann_tag(audio)
+        if tag is not None and tag.blocks_asr:
+            return tag.label
         if not self.cfg.sound_gate:
-            return classify_sound_event_text(text)
-        event = classify_sound_event_text(text)
-        if event:
-            return event
+            return None
         if hint is None:
             hint = analyze_sound(audio)
-        if should_skip_asr(hint, self.cfg.sound_gate_min_conf):
-            return hint.label or "suara non-bicara"
+        st = self.state
         if (
-            not hint.is_speech
-            and hint.category in ("impulse", "burst", "tonal", "noise")
-            and hint.confidence >= 0.42
+            should_skip_asr(hint, self.cfg.sound_gate_min_conf)
+            and not st.event_label
+            and not has_lexical_speech(text)
         ):
             return hint.label or "suara non-bicara"
-        st = self.state
-        if st.non_speech_hops > 0 and hint and not hint.is_speech:
-            return st.sound_label or hint.label or "suara non-bicara"
         return None
 
     def _seal_non_speech(self, label: str) -> str:
         st = self.state
         st.non_speech_only = True
         st.sound_label = label
+        st.event_label = label
         st.language_status = "non-speech"
         st.utterance_langs = []
         st.lid_votes = []
@@ -350,13 +409,14 @@ class StreamingAsr:
         draft = stitch_transcript(st.committed, st.text)
         audio = st.audio_accum
         min_n = int(self.cfg.min_audio_sec * SAMPLE_RATE)
+        self._refresh_event_tag(audio)
         hint = analyze_sound(audio) if self.cfg.sound_gate else None
         st.sound_hint = hint
-        blocked = self._non_speech_label(audio, draft, hint)
-        if blocked or (st.non_speech_only and st.sound_label):
-            return self._seal_non_speech(blocked or st.sound_label)
+        blocked = self._should_block_asr_only(audio, draft, hint)
+        if blocked:
+            return self._seal_non_speech(blocked)
         if not self.cfg.refine_on_commit or audio.size < min_n:
-            return draft
+            return self._with_event(draft)
         st.refining = True
         st.language_status = "refining"
         st.decoding = True
@@ -374,19 +434,23 @@ class StreamingAsr:
         finally:
             st.refining = False
             st.decoding = False
-        blocked = self._non_speech_label(audio, result.text, hint)
+        _, clean = parse_asr_output(result.text, user_language=st.force_language)
+        blocked = self._should_block_asr_only(audio, clean, hint)
         if blocked:
             return self._seal_non_speech(blocked)
         if result.language:
             self._remember_language(result.language)
             if result.language not in st.utterance_langs:
                 st.utterance_langs.append(result.language)
-        if result.text.strip():
+        if clean.strip():
             st.last = result
-            st.text = result.text
-            st.unfixed = result.text
-            return result.text
-        return draft
+            merged = self._with_event(clean)
+            st.text = merged
+            st.unfixed = merged
+            st.non_speech_only = False
+            st.language_status = "mix" if st.utterance_langs else "guessing"
+            return merged
+        return self._with_event(draft)
 
     def _maybe_unlock_on_long_silence(self) -> None:
         st = self.state
@@ -440,22 +504,9 @@ class StreamingAsr:
             return
 
         audio = st.audio_accum
+        self._refresh_event_tag(audio)
         if self.cfg.sound_gate:
-            hint = analyze_sound(audio)
-            st.sound_hint = hint
-            if should_skip_asr(hint, self.cfg.sound_gate_min_conf):
-                st.non_speech_hops += 1
-                st.non_speech_only = True
-                st.sound_label = hint.label or "suara non-bicara"
-                st.language_status = "non-speech"
-                st.unfixed = f"[{st.sound_label}]"
-                st.text = st.unfixed
-                st.raw_decoded = ""
-                st.decoding = False
-                self._emit()
-                return
-            st.non_speech_only = False
-            st.sound_label = ""
+            st.sound_hint = analyze_sound(audio)
         min_n = int(self.cfg.min_audio_sec * SAMPLE_RATE)
         if audio.size < min_n:
             if not allow_short:
@@ -465,20 +516,23 @@ class StreamingAsr:
 
         force = st.force_language
         prefix = ""
-        clean_prev = parse_asr_output(st.raw_decoded, user_language=force or None)[1] or st.text
+        clean_prev = strip_event_prefix(
+            parse_asr_output(st.raw_decoded, user_language=force or None)[1] or st.text
+        )
         if st.chunk_id >= 1 and clean_prev:
             prefix = self.client.rollback_prefix(clean_prev, self.cfg.unfixed_token_num)
 
         def on_partial(lang: str, text: str) -> None:
-            if classify_sound_event_text(text):
-                st.unfixed = f"[{classify_sound_event_text(text)}]"
+            _, clean = parse_asr_output(text, user_language=force or None)
+            if classify_sound_event_text(clean) and not has_lexical_speech(clean):
+                st.unfixed = f"[{classify_sound_event_text(clean)}]"
                 self._emit()
                 return
             if not force:
                 st.language = lang or st.language
             else:
                 st.language = force
-            st.unfixed = text
+            st.unfixed = self._with_event(clean)
             self._emit()
 
         st.decoding = True
@@ -498,7 +552,8 @@ class StreamingAsr:
         finally:
             st.decoding = False
 
-        blocked = self._non_speech_label(audio, result.text, st.sound_hint)
+        _, clean = parse_asr_output(result.text, user_language=force or None)
+        blocked = self._should_block_asr_only(audio, clean, st.sound_hint)
         if blocked:
             st.non_speech_hops += 1
             self._seal_non_speech(blocked)
@@ -508,8 +563,10 @@ class StreamingAsr:
 
         st.last = result
         st.raw_decoded = result.text
-        st.text = result.text
-        st.unfixed = result.text
+        merged = self._with_event(clean)
+        st.text = merged
+        st.unfixed = merged
+        st.non_speech_only = False
         st.chunk_id += 1
 
         if force:
