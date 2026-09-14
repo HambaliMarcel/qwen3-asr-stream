@@ -171,5 +171,5 @@ def analyze(pcm16k: np.ndarray, min_rms: float = 0.008) -> SoundHint:
     return SoundHint(False, category, label, confidence)
 
 
-def should_skip_asr(hint: SoundHint, min_confidence: float = 0.50) -> bool:
+def should_skip_asr(hint: SoundHint, min_confidence: float = 0.62) -> bool:
     return (not hint.is_speech) and hint.category != "silence" and hint.confidence >= min_confidence
