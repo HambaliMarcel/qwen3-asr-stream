@@ -61,6 +61,18 @@ def _apply_cli_overrides(cfg: StreamConfig, args: argparse.Namespace) -> StreamC
         cfg.sound_gate = False
     if getattr(args, "sound_gate_conf", None) is not None:
         cfg.sound_gate_min_conf = float(args.sound_gate_conf)
+    if getattr(args, "sound_model", None) is not None:
+        cfg.sound_model = str(args.sound_model).strip().lower()
+    if getattr(args, "pann_interval", None) is not None:
+        cfg.pann_interval_sec = float(args.pann_interval)
+    if getattr(args, "pann_min_score", None) is not None:
+        cfg.pann_min_score = float(args.pann_min_score)
+    if getattr(args, "pann_block_score", None) is not None:
+        cfg.pann_block_score = float(args.pann_block_score)
+    if getattr(args, "pann_companion_score", None) is not None:
+        cfg.pann_companion_score = float(args.pann_companion_score)
+    if getattr(args, "pann_speech_score", None) is not None:
+        cfg.pann_speech_score = float(args.pann_speech_score)
     return cfg
 
 
