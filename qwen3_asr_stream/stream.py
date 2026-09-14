@@ -49,12 +49,15 @@ from .client import DecodeResult, LlamaAsrClient
 from .parse import (
     classify_sound_event_text,
     combine_event_and_transcript,
+    continuation_language,
     has_lexical_speech,
     infer_languages,
     join_segments,
+    language_plausible,
     merge_languages,
     parse_asr_output,
     prefer_transcript,
+    resolve_language_name,
     strip_event_prefix,
 )
 from .adaptive import RuntimeTuner
@@ -175,18 +178,19 @@ def profile_config(name: str) -> StreamConfig:
             auto_tune=False,
         )
     return StreamConfig(
-        hop_sec=0.40,
+        hop_sec=0.32,
         unfixed_chunk_num=2,
         unfixed_token_num=5,
         max_audio_sec=24.0,
-        min_audio_sec=0.50,
-        max_tokens=128,
-        silence_commit_sec=1.40,
+        min_audio_sec=0.28,
+        max_tokens=48,
+        silence_commit_sec=0.45,
+        silence_hangover_sec=0.16,
         lid_chunk_sec=1.0,
         lid_confirm_chunks=1,
         lid_lock=False,
         unlock_on_utterance=True,
-        refine_on_commit=True,
+        refine_on_commit=False,
         auto_tune=False,
     )
 
@@ -434,8 +438,7 @@ class StreamingAsr:
         hop_sec = self._live_hop()
         hop = int(round(hop_sec * SAMPLE_RATE))
         if st.chunk_id == 0 and st.audio_accum.size == 0:
-            # First words appear after ~0.5 s, not a full hop.
-            hop = min(hop, int(0.5 * SAMPLE_RATE))
+            hop = min(hop, int(max(0.24, self.cfg.min_audio_sec) * SAMPLE_RATE))
         if (speaking or hangover) and st.buffer.size >= hop:
             chunk = st.buffer
             st.buffer = np.zeros((0,), dtype=np.float32)
@@ -880,9 +883,10 @@ class StreamingAsr:
         return audio_sec >= min_s
 
     def _token_budget(self, audio: np.ndarray, base: int, cap: int) -> int:
-        """Grow max_tokens with clip length so long rap is not cut off."""
+        """Keep live hops at the requested cap; grow only for long windows."""
         sec = float(getattr(audio, "size", 0) or 0) / float(SAMPLE_RATE)
-        return min(cap, max(int(base), 48 + int(sec * 16)))
+        extra = int(max(0.0, sec - 1.0) * 16)
+        return min(int(cap), max(int(base), int(base) + extra))
 
     def _consume_chunk(self, chunk: np.ndarray, allow_short: bool = False) -> None:
         st = self.state
@@ -915,7 +919,8 @@ class StreamingAsr:
         # is what makes a hop ~150 ms instead of a full re-transcription.
         prefix = ""
         prev_clean = strip_event_prefix(st.text or "")
-        if st.chunk_id >= 1 and has_lexical_speech(prev_clean):
+        # Official mix: first N hops keep an empty prefix so LID can run.
+        if st.chunk_id >= int(self.cfg.unfixed_chunk_num) and has_lexical_speech(prev_clean):
             prefix = self.client.rollback_prefix(prev_clean, self.cfg.unfixed_token_num)
 
         def on_partial(lang: str, text: str) -> None:
@@ -954,7 +959,11 @@ class StreamingAsr:
                 max_tokens=self._token_budget(audio, self.cfg.max_tokens, 384),
                 temperature=self.cfg.temperature,
                 on_partial=on_partial if self.cfg.stream_tokens else None,
-                prefill_language=st.window_lang or None,
+                prefill_language=(
+                    st.window_lang
+                    if st.window_lang and language_plausible(st.window_lang, prev_clean)
+                    else None
+                ),
             )
         finally:
             st.decoding = False
@@ -992,8 +1001,9 @@ class StreamingAsr:
 
         st.last = result
         st.raw_decoded = result.text
-        if (result.language or "").strip().lower() not in {"", "none"}:
-            st.window_lang = result.language.strip()
+        guessed = (result.language or "").strip()
+        # Official mix: continue with the model's own tag, never a lexicon guess.
+        st.window_lang = continuation_language(guessed, clean)
         merged = self._with_event(clean)
         if st.text and prefix:
             # Continuation must never come back shorter than what LIVE
@@ -1017,10 +1027,19 @@ class StreamingAsr:
             st.language = force
             st.language_status = "forced" if self.cfg.language else "locked"
         else:
-            guessed = (result.language or "").strip()
+            guessed = resolve_language_name(result.language or "")
             inferred = infer_languages(clean, guessed)
             for name in inferred:
                 if not name or name.lower() == "none":
+                    continue
+                if not language_plausible(name, clean) and name not in {
+                    "Japanese",
+                    "Chinese",
+                    "Cantonese",
+                    "Korean",
+                    "Arabic",
+                    "Persian",
+                }:
                     continue
                 st.lid_votes.append(name)
                 if name not in st.utterance_langs:
@@ -1030,10 +1049,15 @@ class StreamingAsr:
             if self.cfg.lid_lock and len(inferred) <= 1:
                 self._maybe_lock_language()
             else:
-                st.language = merge_languages(st.utterance_langs) or guessed
+                current = infer_languages(clean, guessed)
+                mix_family = {"English", "Indonesian", "Malay"}
+                if guessed in mix_family:
+                    st.language = merge_languages(current[:2]) or guessed
+                else:
+                    st.language = guessed or merge_languages(current[:1])
                 st.language_status = (
                     "mix"
-                    if len(st.utterance_langs) > 1
+                    if len(current) > 1
                     or has_lexical_speech(st.unfixed or st.text)
                     else "guessing"
                 )
