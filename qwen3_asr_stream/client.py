@@ -101,10 +101,12 @@ class LlamaAsrClient:
         data = json.loads(body.decode("utf-8"))
         return str(data.get("content") or "")
 
-    def rollback_prefix(self, raw: str, unfixed_token_num: int) -> str:
+    def rollback_prefix(self, raw: str, unfixed_token_num: int, *, exact: bool = True) -> str:
         """Drop the last K tokens using the live GGUF tokenizer (Qwen official strategy)."""
         if not raw or unfixed_token_num <= 0:
             return raw
+        if not exact:
+            return _heuristic_rollback(raw, unfixed_token_num)
         try:
             ids = self.tokenize(raw)
         except LlamaServerError:
@@ -154,7 +156,9 @@ class LlamaAsrClient:
             "top_k": 20,
             "max_tokens": max_tokens,
             "stream": False,
-            "cache_prompt": False,
+            # Server is launched with --cache-prompt; reuse the cached prompt
+            # prefix across the many rolling-window decodes of one utterance.
+            "cache_prompt": True,
         }
         _, body = self._request("/v1/chat/completions", payload)
         data = json.loads(body.decode("utf-8"))
@@ -253,7 +257,7 @@ class LlamaAsrClient:
             "top_k": 20,
             "max_tokens": max_tokens,
             "stream": True,
-            "cache_prompt": False,
+            "cache_prompt": True,
         }
         data = json.dumps(payload).encode("utf-8")
         req = Request(
