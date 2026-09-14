@@ -107,21 +107,57 @@ def _same_line(a: str, b: str) -> bool:
     return x == y or y.startswith(x) or x.startswith(y)
 
 
+def _event_from_raw(raw: str) -> str:
+    t = (raw or "").strip()
+    if t.startswith("[") and "]" in t:
+        inner = t[1 : t.index("]")].strip()
+        if inner:
+            return inner
+    return ""
+
+
+def _event_label(st: StreamState) -> str:
+    tagged = str(getattr(st, "event_label", "") or getattr(st, "sound_label", "") or "").strip()
+    if tagged:
+        return tagged
+    return _event_from_raw(st.unfixed or st.text or "")
+
+
+def _event_payload(st: StreamState) -> dict:
+    event = _event_label(st)
+    top = getattr(st, "event_top", ()) or ()
+    return {
+        "event": event,
+        "event_score": float(getattr(st, "event_score", 0.0) or 0.0),
+        "event_top": [str(x) for x in top[:4]],
+        "companion": bool(getattr(st, "event_is_companion", False)),
+        "non_speech_only": bool(getattr(st, "non_speech_only", False)),
+        "sound_label": str(getattr(st, "sound_label", "") or ""),
+    }
+
+
 class SttPublisher:
-    """Map StreamingAsr on_update → live/commit JSONL events."""
+    """Map StreamingAsr on_update → live/commit/sound JSONL events."""
 
     def __init__(self, hub: JsonlHub, ui: Optional[LiveTranscript] = None):
         self.hub = hub
         self.ui = ui
         self._last_live = ""
         self._last_commit = ""
+        self._last_event = ""
         self._last_emit = 0.0
 
     def on_update(self, st: StreamState) -> None:
         finalized = st.finalized or ""
-        live = strip_event_prefix(st.unfixed or st.text or "")
+        raw = (st.unfixed or st.text or "").strip()
+        live = strip_event_prefix(raw)
+        event = _event_label(st)
+        if not live and event:
+            live = f"[{event}]"
+        display = raw if raw else (f"[{event}]" if event else "")
         now = time.monotonic()
-        if live != self._last_live or (now - self._last_emit) >= 0.08:
+        extras = _event_payload(st)
+        if live != self._last_live or event != self._last_event or (now - self._last_emit) >= 0.04:
             self._last_live = live
             self._last_emit = now
             self.hub.publish(
@@ -129,6 +165,7 @@ class SttPublisher:
                     "v": 1,
                     "type": "live",
                     "text": live,
+                    "display": display,
                     "language": st.language or "",
                     "speaking": bool(st.speaking),
                     "decoding": bool(st.decoding),
@@ -136,8 +173,29 @@ class SttPublisher:
                     "gap_sec": float(st.gap_sec),
                     "silence_sec": float(st.silence_sec),
                     "ts": time.time(),
+                    **extras,
                 }
             )
+        if event and event != self._last_event:
+            self._last_event = event
+            self.hub.publish(
+                {
+                    "v": 1,
+                    "type": "sound",
+                    "text": f"[{event}]",
+                    "display": display or f"[{event}]",
+                    "language": st.language or "",
+                    "speaking": bool(st.speaking),
+                    "decoding": bool(st.decoding),
+                    "utterance_id": int(st.utterance_id),
+                    "gap_sec": float(st.gap_sec),
+                    "silence_sec": float(st.silence_sec),
+                    "ts": time.time(),
+                    **extras,
+                }
+            )
+        elif not event:
+            self._last_event = ""
         if finalized:
             text = strip_event_prefix(finalized)
             if has_lexical_speech(text) and not _same_line(self._last_commit, text):
@@ -147,11 +205,13 @@ class SttPublisher:
                         "v": 1,
                         "type": "commit",
                         "text": text,
+                        "display": finalized.strip() or text,
                         "language": st.language or "",
                         "speaking": False,
                         "decoding": False,
                         "utterance_id": int(st.utterance_id),
                         "ts": time.time(),
+                        **extras,
                     }
                 )
             elif has_lexical_speech(text):
