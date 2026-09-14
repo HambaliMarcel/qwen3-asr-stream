@@ -1,0 +1,6 @@
+clips/*.wav
+clips/*.mp3
+clips/*.flac
+logs/
+results/
+__pycache__/
