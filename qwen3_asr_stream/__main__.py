@@ -37,6 +37,9 @@ def _apply_cli_overrides(cfg: StreamConfig, args: argparse.Namespace) -> StreamC
         cfg.unfixed_token_num = int(args.unfixed_tokens)
     if args.max_audio is not None:
         cfg.max_audio_sec = float(args.max_audio)
+    if getattr(args, "min_audio", None) is not None:
+        cfg.min_audio_sec = float(args.min_audio)
+        _lock(cfg, "min_audio_sec")
     if args.max_tokens is not None:
         cfg.max_tokens = int(args.max_tokens)
     if getattr(args, "language", None) is not None:
@@ -290,6 +293,12 @@ def build_parser() -> argparse.ArgumentParser:
             type=float,
             default=None,
             help="Hard-cut a LIVE window after this many seconds (0 = use built-in 16 s cap)",
+        )
+        sp.add_argument(
+            "--min-audio",
+            type=float,
+            default=None,
+            help="Seconds of speech before the first LIVE decode (ultralow ~0.28)",
         )
         sp.add_argument("--max-tokens", type=int, default=None)
         sp.add_argument(
