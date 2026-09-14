@@ -110,6 +110,7 @@ _BARE_TAG_RE = re.compile(r"(?i)<asr_text>")
 _LANG_ONLY_RE = re.compile(
     r"(?i)(?:^|\s)language\s+(" + "|".join(re.escape(x) for x in SUPPORTED_LANGUAGES) + r")\b"
 )
+_LANG_NONE_RE = re.compile(r"(?i)\blanguage\s+none\b")
 
 
 def strip_asr_markup(text: str) -> tuple[str, str]:
@@ -127,9 +128,15 @@ def strip_asr_markup(text: str) -> tuple[str, str]:
     s = _LANG_TAG_RE.sub("", s)
     s = _BARE_TAG_RE.sub("", s)
     s = _LANG_ONLY_RE.sub(" ", s)
+    s = _LANG_NONE_RE.sub(" ", s)
     s = re.sub(r"[ \t]{2,}", " ", s)
     s = re.sub(r"\s+,", ",", s)
-    return lang, s.strip()
+    if (lang or "").strip().lower() == "none":
+        lang = ""
+    leftover = s.strip()
+    if leftover.lower() in {"none", "language none"}:
+        leftover = ""
+    return lang, leftover
 
 
 def detect_and_fix_repetitions(text: str, threshold: int = 20) -> str:
@@ -163,11 +170,35 @@ def detect_and_fix_repetitions(text: str, threshold: int = 20) -> str:
     return text
 
 
+def _in_order_word_matches(prev_words: list[str], new_words: list[str]) -> int:
+    """Count prev words that appear in order in new (greedy subsequence)."""
+    matched = 0
+    j = 0
+    n = len(new_words)
+    for w in prev_words:
+        while j < n and new_words[j] != w:
+            j += 1
+        if j >= n:
+            break
+        matched += 1
+        j += 1
+    return matched
+
+
+def _join_word_overlap(prev_words: list[str], new_words: list[str], min_words: int) -> int:
+    limit = min(len(prev_words), len(new_words))
+    for i in range(limit, min_words - 1, -1):
+        if prev_words[-i:] == new_words[:i]:
+            return i
+    return 0
+
+
 def stitch_transcript(prev: str, new: str) -> str:
     """Merge prefix + new decode without echoing.
 
     llama.cpp usually re-transcribes the whole window (full hypothesis).
-    vLLM-style official concat is only safe when `new` is a continuation.
+    Concat is only safe when `new` is a short continuation of `prev`.
+    Short word-overlap concat is what doubled rap lines ("no love" / "no love").
     """
     prev = detect_and_fix_repetitions((prev or "").strip())
     new = detect_and_fix_repetitions((new or "").strip())
@@ -184,16 +215,58 @@ def stitch_transcript(prev: str, new: str) -> str:
     if new in prev:
         return prev
 
-    max_k = min(len(prev), len(new))
-    for k in range(max_k, 3, -1):
-        if prev[-k:] == new[:k]:
-            return detect_and_fix_repetitions(prev + new[k:])
-
     pw, nw = prev.split(), new.split()
-    for i in range(min(len(pw), len(nw)), 0, -1):
-        if pw[-i:] == nw[:i]:
-            return detect_and_fix_repetitions(" ".join(pw + nw[i:]))
+    if len(pw) >= 4:
+        matched = _in_order_word_matches(pw, nw)
+        if matched >= max(4, int(0.55 * len(pw))):
+            return new if len(nw) >= len(pw) else prev
 
+    # True continuation: new is short and shares a long tail overlap.
+    min_join = 4 if min(len(pw), len(nw)) >= 6 else 3
+    ov = _join_word_overlap(pw, nw, min_join)
+    if ov and len(nw) <= max(8, len(pw) // 2):
+        return detect_and_fix_repetitions(" ".join(pw + nw[ov:]))
+
+    # Latest full-window hypothesis wins. Never glue on a 1–2 word overlap
+    # (rap repeats those hooks constantly).
+    return new
+
+
+def join_segments(head: str, tail: str) -> str:
+    """Append a finished LIVE window onto the LAST paragraph.
+
+    Windows never share audio, so this is a plain join: a repeated hook line
+    ("no love… no love…") is real speech, not an echo to dedupe.
+    """
+    head = (head or "").strip()
+    tail = (tail or "").strip()
+    if not tail:
+        return head
+    if not head:
+        return tail
+    return head + " " + tail
+
+
+def prefer_transcript(prev: str, new: str) -> str:
+    """Pick the better of two full-window hypotheses — never concatenate.
+
+    Keep `prev` only when `new` looks truncated (seal/max_tokens cut the line).
+    """
+    prev = detect_and_fix_repetitions((prev or "").strip())
+    new = detect_and_fix_repetitions((new or "").strip())
+    if not new:
+        return prev
+    if not prev:
+        return new
+    if not has_lexical_speech(new) and has_lexical_speech(prev):
+        return prev
+    pw, nw = prev.split(), new.split()
+    if prev.startswith(new) and len(pw) > len(nw):
+        return prev
+    if len(nw) < max(3, int(len(pw) * 0.72)) and _in_order_word_matches(nw, pw) >= max(
+        2, int(0.6 * len(nw))
+    ):
+        return prev
     return new
 
 
@@ -202,10 +275,12 @@ def parse_asr_output(raw: str, user_language: Optional[str] = None) -> tuple[str
         return "", ""
     tagged_lang, stripped = strip_asr_markup(str(raw))
     s = detect_and_fix_repetitions(stripped)
+    if (tagged_lang or "").strip().lower() == "none":
+        tagged_lang = ""
     if not s and not tagged_lang:
         return "", ""
 
-    if "language none" in str(raw).lower() and not s:
+    if _LANG_NONE_RE.search(str(raw)) and not s:
         return "", ""
 
     lang = tagged_lang
@@ -240,6 +315,9 @@ def _is_onomatopoeia_only(text: str) -> bool:
 def has_lexical_speech(text: str) -> bool:
     """True when ASR output looks like real words, not only onomatopoeia."""
     t = strip_event_prefix((text or "").strip())
+    t = _LANG_NONE_RE.sub(" ", t).strip()
+    if t.lower() in {"", "none", "language", "language none"}:
+        return False
     if not t:
         return False
     if _is_onomatopoeia_only(t):
