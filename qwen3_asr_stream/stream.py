@@ -20,7 +20,15 @@ import numpy as np
 
 from .audio import SAMPLE_RATE
 from .client import DecodeResult, LlamaAsrClient
-from .parse import classify_sound_event_text, merge_languages, parse_asr_output, stitch_transcript
+from .parse import (
+    classify_sound_event_text,
+    combine_event_and_transcript,
+    has_lexical_speech,
+    merge_languages,
+    parse_asr_output,
+    strip_event_prefix,
+    stitch_transcript,
+)
 from .sound_gate import SoundHint, analyze as analyze_sound, should_skip_asr
 from .vad import EnergyVAD
 
@@ -54,7 +62,14 @@ class StreamConfig:
     unlock_on_utterance: bool = True
     refine_on_commit: bool = True
     sound_gate: bool = True
-    sound_gate_min_conf: float = 0.50
+    sound_gate_min_conf: float = 0.62
+    # auto = PANNs CNN6 if torch installed, else heuristic numpy gate
+    sound_model: str = "auto"
+    pann_interval_sec: float = 1.5
+    pann_min_score: float = 0.45
+    pann_block_score: float = 0.55
+    pann_companion_score: float = 0.38
+    pann_speech_score: float = 0.18
 
 
 def profile_config(name: str) -> StreamConfig:
@@ -150,6 +165,11 @@ class StreamState:
     sound_label: str = ""
     non_speech_only: bool = False
     non_speech_hops: int = 0
+    event_label: str = ""
+    event_score: float = 0.0
+    event_top: tuple[str, ...] = ()
+    pann_last_sec: float = 0.0
+    pann_cached: object = None
 
     @property
     def display_text(self) -> str:
@@ -171,6 +191,7 @@ class StreamingAsr:
         self.on_update = on_update
         self.state = StreamState(cfg=cfg)
         self.vad = EnergyVAD() if cfg.vad else None
+        self._pann = self._init_pann()
         if cfg.language:
             self.state.locked_language = cfg.language
             self.state.language = cfg.language
@@ -196,6 +217,11 @@ class StreamingAsr:
         st.sound_label = ""
         st.non_speech_only = False
         st.non_speech_hops = 0
+        st.event_label = ""
+        st.event_score = 0.0
+        st.event_top = ()
+        st.pann_last_sec = 0.0
+        st.pann_cached = None
         st.speech_seen = tail.size > 0
         st.silence_sec = 0.0
         st.speaking = False
