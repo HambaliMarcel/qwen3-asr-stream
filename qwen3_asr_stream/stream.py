@@ -23,11 +23,26 @@ import numpy as np
 # Companion tags go stale fast (music stops, cough ends). Never prefix a
 # transcript with a tag older than this.
 EVENT_TTL_SEC = 4.0
-# Tail seal budget: prefix the live draft so only the tail is generated.
-SEAL_MAX_TOKENS = 96
+# LAST seal: one full re-decode of the finished window (no prefix), in the
+# background, so early frozen-prefix mistakes get a second look.
+SEAL_MAX_TOKENS = 128
 # Minimum speech-like energy in the leftover buffer to count as an undecoded tail.
 TAIL_MIN_SEC = 0.08
-TAIL_MIN_RMS = 0.010
+TAIL_MIN_RMS = 0.006
+# LIVE → LAST batching. A window this long is sealed into LAST at the next
+# breath gap, and LIVE starts a fresh window — no overlap, so no echo.
+CUT_MIN_SEC = 6.0
+CUT_GAP_SEC = 0.35
+# No breath gap at all (fast rap): cut anyway so the window never grows past
+# what the model decodes in ~200 ms.
+HARD_CUT_SEC = 16.0
+# Between the two: a long window may cut on any short energy dip (word
+# boundary) instead of waiting for a real breath or splitting a word at 16 s.
+MID_CUT_SEC = 11.0
+MID_CUT_GAP_SEC = 0.15
+# A window that has produced no words yet (beat intro, hush the VAD let
+# through) is trimmed to this much audio so `language None` can never lock it.
+IDLE_TRIM_SEC = 1.0
 
 from .audio import SAMPLE_RATE
 from .client import DecodeResult, LlamaAsrClient
@@ -36,10 +51,11 @@ from .parse import (
     combine_event_and_transcript,
     has_lexical_speech,
     infer_languages,
+    join_segments,
     merge_languages,
     parse_asr_output,
+    prefer_transcript,
     strip_event_prefix,
-    stitch_transcript,
 )
 from .adaptive import RuntimeTuner
 from .sound_gate import SoundHint, analyze as analyze_sound, should_skip_asr
@@ -95,7 +111,7 @@ def profile_config(name: str) -> StreamConfig:
     name = (name or "auto").strip().lower()
     if name in ("auto", "adaptive", "smart"):
         return StreamConfig(
-            hop_sec=1.0,
+            hop_sec=0.6,
             unfixed_chunk_num=2,
             unfixed_token_num=5,
             max_audio_sec=24.0,
@@ -195,7 +211,15 @@ class StreamState:
     utterance_id: int = 0
     speech_seen: bool = False
     silence_sec: float = 0.0
-    silence_hangover_until: float = 0.0
+    silence_flushed: bool = False
+    last_speech_at: float = 0.0
+    # Audio-time since the last speech frame (unlike silence_sec, not gated by
+    # the syllable hangover) — drives LIVE→LAST batching at breath gaps.
+    gap_sec: float = 0.0
+    # Language tag the model itself emitted for the current window; used to
+    # keep the continuation prefill in the model's own format.
+    window_lang: str = ""
+    segments: int = 0
     speaking: bool = False
     decoding: bool = False
     level: float = 0.0
@@ -288,7 +312,8 @@ class StreamingAsr:
         st.chunk_id = 0
         st.lid_rounds = 0
         st.utterance_langs = []
-        st.refining = False
+        # `refining` is owned by the seal thread (see _seal_alive), so the
+        # LAST · sealing label survives the reset into the next LIVE line.
         st.sound_hint = None
         st.sound_label = ""
         st.non_speech_only = False
@@ -302,7 +327,11 @@ class StreamingAsr:
         st.pann_cached = None
         st.speech_seen = tail.size > 0
         st.silence_sec = 0.0
-        st.silence_hangover_until = 0.0
+        st.silence_flushed = False
+        st.last_speech_at = 0.0
+        st.gap_sec = 0.0
+        st.window_lang = ""
+        st.segments = 0
         st.speaking = False
         st.decoding = False
         st.utterance_id += 1
@@ -370,10 +399,15 @@ class StreamingAsr:
                     self._tuner.record_early_resume()
                 st.speech_seen = True
                 st.silence_sec = 0.0
-                st.silence_hangover_until = now + self._live_hangover()
+                st.silence_flushed = False
+                st.last_speech_at = now
+                st.gap_sec = 0.0
                 self._clear_non_speech_lock()
             else:
-                if st.speech_seen and now >= st.silence_hangover_until:
+                # Audio-time, not wall-clock: file mode and a busy decode
+                # thread must not stretch or shrink the pause.
+                st.gap_sec += dt
+                if st.speech_seen and st.gap_sec >= self._live_hangover():
                     st.silence_sec += dt
                 if not st.speech_seen:
                     st.speaking = False
@@ -383,20 +417,41 @@ class StreamingAsr:
         else:
             if speaking:
                 st.speech_seen = True
+                st.last_speech_at = now
                 self._clear_non_speech_lock()
         st.speaking = bool(speaking)
 
-        if speaking or st.speech_seen:
+        hangover = st.speech_seen and not speaking and st.gap_sec < self._live_hangover()
+        if speaking or hangover:
             st.buffer = np.concatenate([st.buffer, x], axis=0)
+        elif st.speech_seen and not st.silence_flushed:
+            # Breath gap confirmed. Decode the leftover once (it holds the end
+            # of the last word) and then stop feeding silence to the GPU —
+            # silence hops only re-emit the line and stall the mic loop.
+            st.silence_flushed = True
+            self._flush_buffer_decode()
 
-        # LIVE must keep draining during pauses. Suppressing hop decodes while
-        # silent is what froze LIVE for ~1s before every commit.
         hop_sec = self._live_hop()
         hop = int(round(hop_sec * SAMPLE_RATE))
-        if st.buffer.size >= hop:
+        if st.chunk_id == 0 and st.audio_accum.size == 0:
+            # First words appear after ~0.5 s, not a full hop.
+            hop = min(hop, int(0.5 * SAMPLE_RATE))
+        if (speaking or hangover) and st.buffer.size >= hop:
             chunk = st.buffer
             st.buffer = np.zeros((0,), dtype=np.float32)
             self._consume_chunk(chunk)
+
+        # Batching: a long window is moved to LAST at the first breath gap and
+        # LIVE keeps going in a fresh window. LAST grows while the speaker
+        # never really stops (long rap), and each hop stays ~200 ms.
+        if self.vad is not None and st.speech_seen and not speaking:
+            win = st.audio_accum.size + st.buffer.size
+            breath = st.silence_flushed and st.gap_sec >= max(CUT_GAP_SEC, self._live_hangover())
+            dip = st.gap_sec >= MID_CUT_GAP_SEC and win >= int(MID_CUT_SEC * SAMPLE_RATE)
+            if (
+                (breath and win >= int(CUT_MIN_SEC * SAMPLE_RATE)) or dip
+            ) and has_lexical_speech(strip_event_prefix(st.text)):
+                self._cut_window()
 
         commit_after = self._live_pause()
         if (
@@ -404,10 +459,53 @@ class StreamingAsr:
             and st.speech_seen
             and st.silence_sec >= commit_after
         ):
-            self.commit()
-            unlock = bool(self.cfg.unlock_on_utterance) and not self.cfg.language
-            self.reset_utterance(keep_tail=False, unlock=unlock)
+            live = strip_event_prefix(st.unfixed or st.text or st.committed or "")
+            if has_lexical_speech(live) or st.non_speech_only or st.committed:
+                self.commit()
+                unlock = bool(self.cfg.unlock_on_utterance) and not self.cfg.language
+                self.reset_utterance(keep_tail=False, unlock=unlock)
+            elif st.silence_sec >= commit_after + 0.6:
+                # False VAD start (hush decoded as language none) — drop it.
+                unlock = bool(self.cfg.unlock_on_utterance) and not self.cfg.language
+                self.reset_utterance(keep_tail=False, unlock=unlock)
             self._emit()
+
+    def _cut_window(self) -> None:
+        """Seal the current LIVE window into LAST and start a fresh one.
+
+        No audio is carried over, so the next window can never re-transcribe
+        (echo) words that are already in LAST.
+        """
+        st = self.state
+        self._flush_buffer_decode()
+        seg = strip_event_prefix(st.text or "")
+        if has_lexical_speech(seg):
+            if self._seal_alive():
+                # An older seal must not paint its paragraph over this one.
+                self._refine_gen += 1
+            st.committed = join_segments(st.committed, seg)
+            st.finalized = self._with_event(st.committed)
+            st.segments += 1
+        st.audio_accum = np.zeros((0,), dtype=np.float32)
+        st.raw_decoded = ""
+        st.text = ""
+        st.unfixed = ""
+        st.chunk_id = 0
+        st.window_lang = ""
+        st.pann_cached = None
+        st.pann_last_sec = 0.0
+        self._emit()
+
+    def _flush_buffer_decode(self) -> None:
+        """Decode whatever is left in the hop buffer (end of the last word)."""
+        st = self.state
+        if st.buffer.size == 0:
+            return
+        chunk = st.buffer
+        st.buffer = np.zeros((0,), dtype=np.float32)
+        if st.audio_accum.size == 0 and not self._buffer_has_speech_in(chunk):
+            return
+        self._consume_chunk(chunk, allow_short=True)
 
     def finish(self) -> StreamState:
         self._absorb_buffer()
@@ -427,11 +525,13 @@ class StreamingAsr:
 
     def _buffer_has_speech(self) -> bool:
         """True when the leftover buffer holds real speech energy, not just silence."""
-        st = self.state
-        n = st.buffer.size
+        return self._buffer_has_speech_in(self.state.buffer)
+
+    def _buffer_has_speech_in(self, buf: np.ndarray) -> bool:
+        n = buf.size
         if n < int(TAIL_MIN_SEC * SAMPLE_RATE):
             return False
-        tail = st.buffer[-int(min(n, 0.6 * SAMPLE_RATE)) :]
+        tail = buf[-int(min(n, 0.6 * SAMPLE_RATE)) :]
         if tail.size == 0:
             return False
         rms = float(np.sqrt(np.mean(np.square(tail), dtype=np.float32)))
@@ -446,24 +546,35 @@ class StreamingAsr:
                 pass
         return True
 
-    def _has_undecoded_tail(self) -> bool:
-        return self._buffer_has_speech()
-
     def join_refine(self, timeout: float = 6.0) -> str:
         t = self._refine_thread
         if t is not None and t.is_alive():
             t.join(timeout=timeout)
         return self.state.finalized or ""
 
+    def _seal_alive(self) -> bool:
+        t = self._refine_thread
+        alive = t is not None and t.is_alive()
+        if not alive and self.state.refining:
+            self.state.refining = False
+        return alive
+
     def commit(self, wait: bool = False, timeout: float = 6.0) -> str:
-        """End utterance: LAST shows the live draft instantly, tail seals behind it."""
+        """End utterance: LAST shows the live draft instantly, seal re-checks it behind."""
         st = self.state
-        has_tail = self._has_undecoded_tail()
-        self._absorb_buffer()
-        draft = self._with_event(stitch_transcript(st.committed, st.text))
+        # Last word may still be in the buffer: one short decode (~150 ms).
+        self._flush_buffer_decode()
+        head = st.committed
+        seg = strip_event_prefix(st.text or "")
+        draft = self._with_event(join_segments(head, seg))
         if not st.non_speech_only:
             st.language = merge_languages(st.utterance_langs) or st.language
-        # Instant LAST — the mic loop never blocks on the seal pass.
+        lexical = has_lexical_speech(strip_event_prefix(draft))
+        if not lexical and not st.non_speech_only:
+            # Hush / `language None` is not a line — keep LAST as it was.
+            st.refining = False
+            self._emit()
+            return ""
         st.finalized = draft
         st.refining = False
         self._emit()
@@ -472,28 +583,28 @@ class StreamingAsr:
         self._last_commit_at = time.monotonic()
         self._last_commit_silence = float(st.silence_sec)
         min_n = int(self.cfg.min_audio_sec * SAMPLE_RATE)
-        utterance_id = st.utterance_id
+        if self._seal_alive():
+            # Older seal still in flight — it must not paint over this LAST.
+            self._refine_gen += 1
         if (
-            self._tuner.should_refine(utterance_sec, draft, has_tail=has_tail)
+            has_lexical_speech(seg)
+            and self._tuner.should_refine(utterance_sec, seg, has_tail=False)
             and st.audio_accum.size >= min_n
             and not st.non_speech_only
         ):
-            self._start_refine_background(
-                st.audio_accum.copy(),
-                draft,
-                utterance_id,
-            )
+            self._start_refine_background(st.audio_accum.copy(), head, seg)
         if wait:
             self.join_refine(timeout)
             return self.state.finalized or draft
         return draft
 
-    def _start_refine_background(
-        self,
-        audio: np.ndarray,
-        draft: str,
-        utterance_id: int,
-    ) -> None:
+    def _start_refine_background(self, audio: np.ndarray, head: str, seg: str) -> None:
+        """Full re-decode of the last window in a thread.
+
+        Live hops are never held back for it: the slot is idle anyway during
+        the pause that triggered the commit, and the result only replaces the
+        last segment of LAST when it is at least as complete as the draft.
+        """
         self._refine_gen += 1
         gen = self._refine_gen
         st = self.state
@@ -505,24 +616,22 @@ class StreamingAsr:
         st.refining = True
         self._emit()
 
+        def paint(seg_text: str) -> None:
+            body = strip_event_prefix(seg_text)
+            merged = join_segments(head, prefer_transcript(seg, body))
+            if event_label:
+                merged = combine_event_and_transcript(event_label, merged)
+            self.state.finalized = merged
+
         def run() -> None:
             try:
-                merged = self._refine_audio_snapshot(audio, draft, gen, event_label)
+                sealed = self._refine_audio_snapshot(audio, seg, gen, paint)
             except Exception:
-                merged = draft
+                sealed = seg
             if gen != self._refine_gen:
                 return
-            if not (merged or "").strip():
-                merged = draft
-            st = self.state
-            # LAST belongs to the committed utterance: always safe to paint it,
-            # even after reset_utterance started the next LIVE line.
-            st.finalized = merged
-            if st.utterance_id == utterance_id:
-                st.refining = False
-            else:
-                # New utterance already speaking; don't leave a stale SEAL flag.
-                self.state.refining = False
+            paint(sealed or seg)
+            self.state.refining = False
             self._emit()
 
         self._refine_thread = threading.Thread(target=run, daemon=True)
@@ -531,25 +640,13 @@ class StreamingAsr:
     def _refine_audio_snapshot(
         self,
         audio: np.ndarray,
-        draft: str,
+        seg: str,
         gen: int,
-        event_label: str = "",
+        paint: Callable[[str], None],
     ) -> str:
-        """Fast LAST seal: prefix the live draft, stream tokens, skip extra PANNs."""
-        body = strip_event_prefix(draft)
-        lexical = has_lexical_speech(body)
-        if not lexical:
-            hint = analyze_sound(audio) if self._live_sound_gate() else None
-            blocked = self._block_label_stateless(audio, draft, hint)
-            if blocked:
-                return f"[{blocked}]"
-        prefix = ""
-        max_tok = SEAL_MAX_TOKENS
-        if lexical:
-            # Token-exact rollback keeps continuity; heuristic fallback inside.
-            prefix = self.client.rollback_prefix(body, self.cfg.unfixed_token_num)
-        else:
-            max_tok = min(self.cfg.refine_max_tokens, 128)
+        """LAST seal: one full-window decode (no prefix) of the finished segment."""
+        body = strip_event_prefix(seg)
+        max_tok = self._token_budget(audio, SEAL_MAX_TOKENS, 512)
 
         def on_partial(_lang: str, text: str) -> None:
             if gen != self._refine_gen:
@@ -558,13 +655,15 @@ class StreamingAsr:
             clean = strip_event_prefix(clean)
             if not clean.strip():
                 return
-            st = self.state
-            st.finalized = clean
+            dw, cw = body.split(), clean.split()
+            if len(cw) < max(4, int(len(dw) * 0.72)):
+                return
+            paint(clean)
             self._emit()
 
         result = self.client.transcribe(
             audio,
-            raw_prefix=prefix,
+            raw_prefix="",
             context=self.cfg.context,
             force_language=self.cfg.language,
             max_tokens=max_tok,
@@ -573,16 +672,9 @@ class StreamingAsr:
         )
         _, clean = parse_asr_output(result.text, user_language=self.cfg.language)
         clean = strip_event_prefix(clean)
-        if not lexical:
-            hint = analyze_sound(audio) if self._live_sound_gate() else None
-            blocked = self._block_label_stateless(audio, clean or draft, hint)
-            if blocked:
-                return f"[{blocked}]"
-        if clean.strip():
-            if event_label:
-                return combine_event_and_transcript(event_label, clean)
+        if has_lexical_speech(clean):
             return clean
-        return draft
+        return seg
 
     def _block_label_stateless(
         self,
@@ -761,55 +853,6 @@ class StreamingAsr:
         st.raw_decoded = ""
         return st.unfixed
 
-    def _refine_utterance(self) -> str:
-        """Official offline transcribe of the full utterance (no prefix, no force)."""
-        st = self.state
-        draft = stitch_transcript(st.committed, st.text)
-        audio = st.audio_accum
-        min_n = int(self.cfg.min_audio_sec * SAMPLE_RATE)
-        self._refresh_event_tag(audio)
-        hint = analyze_sound(audio) if self._live_sound_gate() else None
-        st.sound_hint = hint
-        blocked = self._should_block_refine_only(audio, draft, hint)
-        if blocked:
-            return self._seal_non_speech(blocked)
-        if not self.cfg.refine_on_commit or audio.size < min_n:
-            return self._with_event(draft)
-        st.refining = True
-        st.language_status = "refining"
-        st.decoding = True
-        self._emit()
-        try:
-            result = self.client.transcribe(
-                audio,
-                raw_prefix="",
-                context=self.cfg.context,
-                force_language=self.cfg.language,
-                max_tokens=self.cfg.refine_max_tokens,
-                temperature=0.01,
-                on_partial=None,
-            )
-        finally:
-            st.refining = False
-            st.decoding = False
-        _, clean = parse_asr_output(result.text, user_language=st.force_language)
-        blocked = self._should_block_refine_only(audio, clean, hint)
-        if blocked:
-            return self._seal_non_speech(blocked)
-        if result.language:
-            self._remember_language(result.language)
-            if result.language not in st.utterance_langs:
-                st.utterance_langs.append(result.language)
-        if clean.strip():
-            st.last = result
-            merged = self._with_event(clean)
-            st.text = merged
-            st.unfixed = merged
-            st.non_speech_only = False
-            st.language_status = "mix" if st.utterance_langs else "guessing"
-            return merged
-        return self._with_event(draft)
-
     def _maybe_unlock_on_long_silence(self) -> None:
         st = self.state
         if (
@@ -836,6 +879,11 @@ class StreamingAsr:
         # is met, so LIVE is not blank while SPEAKING.
         return audio_sec >= min_s
 
+    def _token_budget(self, audio: np.ndarray, base: int, cap: int) -> int:
+        """Grow max_tokens with clip length so long rap is not cut off."""
+        sec = float(getattr(audio, "size", 0) or 0) / float(SAMPLE_RATE)
+        return min(cap, max(int(base), 48 + int(sec * 16)))
+
     def _consume_chunk(self, chunk: np.ndarray, allow_short: bool = False) -> None:
         st = self.state
         self._sync_pann_model()
@@ -843,22 +891,11 @@ class StreamingAsr:
             st.audio_accum = chunk
         else:
             st.audio_accum = np.concatenate([st.audio_accum, chunk], axis=0)
-
-        if self.cfg.max_audio_sec > 0:
-            cap = int(self.cfg.max_audio_sec * SAMPLE_RATE)
-            if st.audio_accum.size > cap:
-                if st.text:
-                    st.committed = stitch_transcript(st.committed, st.text)
-                n = int(self.cfg.overlap_sec * SAMPLE_RATE)
-                st.audio_accum = st.audio_accum[-n:]
-                st.raw_decoded = ""
-                st.chunk_id = 0
-                st.unfixed = ""
-                # Keep locked language across the rolling window (same session).
+        self._seal_alive()
 
         if not self._ready_for_decode(allow_short):
             if not st.force_language:
-                st.language_status = "waiting" if not st.lid_votes else "confirming"
+                st.language_status = "waiting" if not st.lid_votes else "guessing"
             self._emit()
             return
 
@@ -873,15 +910,13 @@ class StreamingAsr:
             audio = np.pad(audio, (0, min_n - int(audio.size)))
 
         force = st.force_language
+        # Official streaming: the window's fixed text (minus the last K
+        # tokens) is prefilled and the model only writes the new tail. That
+        # is what makes a hop ~150 ms instead of a full re-transcription.
         prefix = ""
-        clean_prev = strip_event_prefix(
-            parse_asr_output(st.raw_decoded, user_language=force or None)[1] or st.text
-        )
-        if st.chunk_id >= 1 and clean_prev:
-            # Token-exact rollback keeps continuity from the second hop.
-            # Language bias is handled in infer_languages, not by dropping
-            # the prefix (dropping it made every hop rewrite from scratch).
-            prefix = self.client.rollback_prefix(clean_prev, self.cfg.unfixed_token_num)
+        prev_clean = strip_event_prefix(st.text or "")
+        if st.chunk_id >= 1 and has_lexical_speech(prev_clean):
+            prefix = self.client.rollback_prefix(prev_clean, self.cfg.unfixed_token_num)
 
         def on_partial(lang: str, text: str) -> None:
             _, clean = parse_asr_output(text, user_language=force or None)
@@ -889,6 +924,12 @@ class StreamingAsr:
                 st.sound_label = classify_sound_event_text(clean) or ""
                 st.unfixed = f"[{st.sound_label}]"
                 self._emit()
+                return
+            if not clean.strip() or not has_lexical_speech(clean):
+                return
+            if prefix and len(clean) < len(prev_clean) and prev_clean.startswith(clean):
+                # First streamed delta is just the rolled-back prefill —
+                # repainting it would make the last words blink every hop.
                 return
             st.sound_label = ""
             if not force:
@@ -899,10 +940,10 @@ class StreamingAsr:
             self._emit()
 
         st.decoding = True
-        if not force and not has_lexical_speech(st.unfixed or st.text):
-            st.language_status = "confirming" if st.lid_votes else "guessing"
-        elif not force:
-            st.language_status = "mix"
+        if not force:
+            st.language_status = (
+                "mix" if has_lexical_speech(st.unfixed or st.text) else "guessing"
+            )
         self._emit()
         try:
             result = self.client.transcribe(
@@ -910,9 +951,10 @@ class StreamingAsr:
                 raw_prefix=prefix,
                 context=self.cfg.context,
                 force_language=force,
-                max_tokens=self.cfg.max_tokens,
+                max_tokens=self._token_budget(audio, self.cfg.max_tokens, 384),
                 temperature=self.cfg.temperature,
                 on_partial=on_partial if self.cfg.stream_tokens else None,
+                prefill_language=st.window_lang or None,
             )
         finally:
             st.decoding = False
@@ -927,10 +969,36 @@ class StreamingAsr:
             st.chunk_id += 1
             self._emit()
             return
+        else:
+            # `language None` / empty. If this window has no words yet, keep
+            # only a short tail so a beat intro or hush never becomes a 10 s
+            # window the model keeps calling non-speech.
+            st.last = result
+            self._tuner.record_decode(result)
+            if not has_lexical_speech(strip_event_prefix(st.text or "")):
+                keep = int(IDLE_TRIM_SEC * SAMPLE_RATE)
+                if st.audio_accum.size > keep:
+                    st.audio_accum = st.audio_accum[-keep:]
+                st.chunk_id = 0
+                st.raw_decoded = ""
+                if self._pann is not None:
+                    self._refresh_event_tag(audio)
+                    if st.event_label and self._event_fresh():
+                        st.unfixed = f"[{st.event_label}]"
+            else:
+                st.chunk_id += 1
+            self._emit()
+            return
 
         st.last = result
         st.raw_decoded = result.text
+        if (result.language or "").strip().lower() not in {"", "none"}:
+            st.window_lang = result.language.strip()
         merged = self._with_event(clean)
+        if st.text and prefix:
+            # Continuation must never come back shorter than what LIVE
+            # already showed (token cap / early EOS).
+            merged = prefer_transcript(st.text, merged)
         st.text = merged
         st.unfixed = merged
         st.non_speech_only = False
@@ -940,6 +1008,9 @@ class StreamingAsr:
         # PANNs after ASR so tagging never blocks the live decode path.
         if st.chunk_id % 2 == 0 and self._pann is not None:
             self._refresh_event_tag(audio)
+        if st.audio_accum.size >= int(HARD_CUT_SEC * SAMPLE_RATE):
+            self._cut_window()
+            return
 
         if force:
             st.language = force
@@ -998,7 +1069,7 @@ class StreamingAsr:
 
     def _remember_language(self, lang: str) -> None:
         lang = (lang or "").strip()
-        if lang and lang not in self.state.languages_seen:
+        if lang and lang.lower() != "none" and lang not in self.state.languages_seen:
             self.state.languages_seen.append(lang)
 
     def _emit(self) -> None:
