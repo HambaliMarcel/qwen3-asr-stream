@@ -285,7 +285,12 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--hop", type=float, default=None, help="Audio hop seconds (default from profile)")
         sp.add_argument("--unfixed-chunks", type=int, default=None)
         sp.add_argument("--unfixed-tokens", type=int, default=None)
-        sp.add_argument("--max-audio", type=float, default=None, help="Rolling window seconds, 0 = grow forever")
+        sp.add_argument(
+            "--max-audio",
+            type=float,
+            default=None,
+            help="Hard-cut a LIVE window after this many seconds (0 = use built-in 16 s cap)",
+        )
         sp.add_argument("--max-tokens", type=int, default=None)
         sp.add_argument(
             "--language",
@@ -294,7 +299,12 @@ def build_parser() -> argparse.ArgumentParser:
         )
         sp.add_argument("--lid-wait", type=float, default=None, help="Seconds of speech before first LID (official 2.0)")
         sp.add_argument("--lid-confirm", type=int, default=None, help="Open 2s chunks before lock (SDK 2, paper 4)")
-        sp.add_argument("--relid-after", type=float, default=None, help="Re-open LID after this many silent seconds (default 8)")
+        sp.add_argument(
+            "--relid-after",
+            type=float,
+            default=None,
+            help="Re-open LID after this many silent seconds (default: off)",
+        )
         sp.add_argument(
             "--lid-lock",
             dest="lid_lock_on",

@@ -1008,7 +1008,8 @@ class StreamingAsr:
         # PANNs after ASR so tagging never blocks the live decode path.
         if st.chunk_id % 2 == 0 and self._pann is not None:
             self._refresh_event_tag(audio)
-        if st.audio_accum.size >= int(HARD_CUT_SEC * SAMPLE_RATE):
+        hard_cut = self.cfg.max_audio_sec if self.cfg.max_audio_sec > 0 else HARD_CUT_SEC
+        if st.audio_accum.size >= int(hard_cut * SAMPLE_RATE):
             self._cut_window()
             return
 

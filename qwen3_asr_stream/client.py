@@ -157,7 +157,7 @@ class LlamaAsrClient:
             "max_tokens": max_tokens,
             "stream": False,
             # Server is launched with --cache-prompt; reuse the cached prompt
-            # prefix across the many rolling-window decodes of one utterance.
+            # prefix across continuation decodes within one utterance window.
             "cache_prompt": True,
         }
         _, body = self._request("/v1/chat/completions", payload)
