@@ -26,7 +26,7 @@ from .ui import LiveTranscript
 
 
 DEFAULT_BUS_PORT = 18765
-COMMIT_SETTLE_SEC = 0.08
+COMMIT_SETTLE_SEC = 0.0
 
 
 class JsonlHub:
@@ -130,6 +130,14 @@ def _event_payload(st: StreamState) -> dict:
     }
 
 
+def _same_line(prev: str, new: str) -> bool:
+    a = (prev or "").strip().lower()
+    b = (new or "").strip().lower()
+    if not a or not b:
+        return False
+    return a == b or b.startswith(a) or a.startswith(b)
+
+
 class SttPublisher:
     """Map StreamingAsr on_update → live/commit/sound JSONL events."""
 
@@ -147,24 +155,20 @@ class SttPublisher:
         self._refining_uid = -1
 
     def _queue_commit(self, payload: dict, *, refining: bool) -> None:
-        """Publish only the settled LAST, not the pre-refine draft seal."""
+        """Publish LAST as soon as it exists. Refine may replace the payload
+        before a duplicate send, but it never blocks the first send."""
         uid = int(payload.get("utterance_id") or 0)
+        text = str(payload.get("text") or "").strip()
         with self._commit_lock:
+            if uid == self._last_commit_uid and _same_line(self._last_commit, text):
+                if not text or len(text) <= len(self._last_commit):
+                    return
             self._pending_commit = payload
             self._commit_seq += 1
             seq = self._commit_seq
             if refining:
                 self._refining_uid = uid
-                return
-            refined = self._refining_uid == uid
-            if refined:
-                self._refining_uid = -1
-        if refined:
-            self._flush_commit(seq)
-            return
-        timer = threading.Timer(COMMIT_SETTLE_SEC, self._flush_commit, args=(seq,))
-        timer.daemon = True
-        timer.start()
+        self._flush_commit(seq)
 
     def _flush_commit(self, seq: int) -> None:
         with self._commit_lock:
@@ -174,8 +178,11 @@ class SttPublisher:
             self._pending_commit = None
         text = str(payload.get("text") or "").strip()
         uid = int(payload.get("utterance_id") or 0)
-        if not text or (uid == self._last_commit_uid and text == self._last_commit):
+        if not text:
             return
+        if uid == self._last_commit_uid and _same_line(self._last_commit, text):
+            if len(text) <= len(self._last_commit):
+                return
         self._last_commit = text
         self._last_commit_uid = uid
         self.hub.publish(payload)
@@ -211,22 +218,21 @@ class SttPublisher:
             )
         if event and event != self._last_event:
             self._last_event = event
-            self.hub.publish(
-                {
-                    "v": 1,
-                    "type": "sound",
-                    "text": f"[{event}]",
-                    "display": display or f"[{event}]",
-                    "language": st.language or "",
-                    "speaking": bool(st.speaking),
-                    "decoding": bool(st.decoding),
-                    "utterance_id": int(st.utterance_id),
-                    "gap_sec": float(st.gap_sec),
-                    "silence_sec": float(st.silence_sec),
-                    "ts": time.time(),
-                    **extras,
-                }
-            )
+            sound = {
+                "v": 1,
+                "type": "sound",
+                "text": f"[{event}]",
+                "display": display or f"[{event}]",
+                "language": st.language or "",
+                "speaking": bool(st.speaking),
+                "decoding": bool(st.decoding),
+                "utterance_id": int(st.utterance_id),
+                "gap_sec": float(st.gap_sec),
+                "silence_sec": float(st.silence_sec),
+                "ts": time.time(),
+                **extras,
+            }
+            self.hub.publish(sound)
         elif not event:
             self._last_event = ""
         if finalized:
