@@ -1,2 +1,4 @@
 numpy>=1.26
 sounddevice>=0.5.1
+# Recommended: anti-aliased mic resampling (linear fallback if missing)
+scipy>=1.10
