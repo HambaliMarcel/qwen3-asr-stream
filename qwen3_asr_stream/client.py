@@ -177,10 +177,20 @@ class LlamaAsrClient:
         max_tokens: int = 32,
         temperature: float = 0.01,
         on_partial: Optional[Callable[[str, str], None]] = None,
+        prefill_language: Optional[str] = None,
     ) -> DecodeResult:
+        """One decode of `pcm`.
+
+        `raw_prefix` is the fixed text the model must continue (official
+        streaming). `prefill_language` is the tag the model itself emitted for
+        this window — it keeps the prefill in the model's own output format
+        (`language X<asr_text>…`) so it continues instead of restarting the
+        line. It is not a user-forced language: `force_language` is.
+        """
         wav = pcm_to_wav_bytes(pcm, SAMPLE_RATE)
         wav_b64 = base64.b64encode(wav).decode("ascii")
-        prefill = assistant_prefill(raw_prefix, force_language)
+        tag_lang = force_language or (prefill_language if raw_prefix else None)
+        prefill = assistant_prefill(raw_prefix, tag_lang)
         audio_sec = float(getattr(pcm, "size", 0)) / float(SAMPLE_RATE)
         t0 = time.perf_counter()
 
