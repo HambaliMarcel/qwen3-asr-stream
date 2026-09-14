@@ -103,14 +103,27 @@ def canonicalize_language(language: Optional[str]) -> Optional[str]:
     return name
 
 
-_LANG_TAG_RE = re.compile(
-    r"(?is)language\s+([A-Za-z]+)\s*<asr_text>"
-)
 _BARE_TAG_RE = re.compile(r"(?i)<asr_text>")
-_LANG_ONLY_RE = re.compile(
-    r"(?i)(?:^|\s)language\s+(" + "|".join(re.escape(x) for x in SUPPORTED_LANGUAGES) + r")\b"
+_LANG_ANY_RE = re.compile(
+    r"(?i)(?:^|\s)language\s+([A-Za-z]+)\b(?:\s*<asr_text>)?"
 )
 _LANG_NONE_RE = re.compile(r"(?i)\blanguage\s+none\b")
+
+
+def resolve_language_name(raw: str) -> str:
+    """Map a model LID token, including truncated leaks like `Canton`."""
+    s = (raw or "").strip()
+    if not s or s.lower() == "none":
+        return ""
+    try:
+        return canonicalize_language(s) or ""
+    except ValueError:
+        pass
+    key = s.lower()
+    matches = [name for name in SUPPORTED_LANGUAGES if name.lower().startswith(key)]
+    if len(matches) == 1 and len(key) >= 3:
+        return matches[0]
+    return ""
 
 
 def strip_asr_markup(text: str) -> tuple[str, str]:
@@ -118,21 +131,24 @@ def strip_asr_markup(text: str) -> tuple[str, str]:
     if not text:
         return "", ""
     s = str(text)
-    langs = [m.group(1) for m in _LANG_TAG_RE.finditer(s)]
-    lang = ""
-    if langs:
-        try:
-            lang = normalize_language_name(langs[-1])
-        except ValueError:
-            lang = langs[-1]
-    s = _LANG_TAG_RE.sub("", s)
+    langs: list[str] = []
+
+    def _take(match: re.Match[str]) -> str:
+        token = match.group(1)
+        named = resolve_language_name(token)
+        tagged = "<asr_text>" in match.group(0).lower()
+        if token.lower() == "none" or named or tagged:
+            if named:
+                langs.append(named)
+            return " "
+        return match.group(0)
+
+    s = _LANG_ANY_RE.sub(_take, s)
     s = _BARE_TAG_RE.sub("", s)
-    s = _LANG_ONLY_RE.sub(" ", s)
     s = _LANG_NONE_RE.sub(" ", s)
     s = re.sub(r"[ \t]{2,}", " ", s)
     s = re.sub(r"\s+,", ",", s)
-    if (lang or "").strip().lower() == "none":
-        lang = ""
+    lang = langs[-1] if langs else ""
     leftover = s.strip()
     if leftover.lower() in {"none", "language none"}:
         leftover = ""
@@ -298,7 +314,7 @@ _EVENT_EN = re.compile(
 
 
 _LEXICAL_RE = re.compile(
-    r"[A-Za-zÀ-ÿ]{2,}|[\u4e00-\u9fff]{2,}|[\u3040-\u30ff]{2,}|[\uac00-\ud7af]{2,}|\d{2,}"
+    r"[A-Za-zÀ-ÿ]{2,}|[\u4e00-\u9fff]+|[\u3040-\u30ff]+|[\uac00-\ud7af]+|\d{2,}"
 )
 _ONOMATOPOEIA_CJK = frozenset("咳嗯呵啊呃哈")
 
@@ -380,8 +396,6 @@ def classify_sound_event_text(text: str) -> Optional[str]:
         return "batuk?"
     if _EVENT_CJK.fullmatch(t):
         return "suara non-bicara?"
-    if len(core) <= 8 and len(set(core)) <= 2 and all("\u4e00" <= c <= "\u9fff" for c in core):
-        return "suara non-bicara?"
     return None
 
 
@@ -450,6 +464,20 @@ _ID_WORDS = frozenset(
         "bu",
         "mas",
         "mbak",
+        "kabar",
+        "berapa",
+        "jam",
+        "heran",
+        "desa",
+        "tak",
+        "gue",
+        "lu",
+        "lo",
+        "emang",
+        "ngakak",
+        "wkwk",
+        "anjir",
+        "buset",
     }
 )
 _EN_WORDS = frozenset(
@@ -486,6 +514,11 @@ _EN_WORDS = frozenset(
     }
 )
 _WORD_RE = re.compile(r"[A-Za-zÀ-ÿ']+")
+_CJK_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]")
+_ARABIC_RE = re.compile(r"[\u0600-\u06ff]")
+_CJK_LANGS = {"Japanese", "Chinese", "Cantonese", "Korean"}
+_ARABIC_LANGS = {"Arabic", "Persian"}
+_ROMANCE_LANGS = {"Spanish", "Portuguese", "French", "Italian", "Romanian"}
 
 
 def _lang_word_scores(text: str) -> tuple[int, int]:
@@ -495,39 +528,107 @@ def _lang_word_scores(text: str) -> tuple[int, int]:
     return id_n, en_n
 
 
-def infer_languages(text: str, tagged: str = "") -> list[str]:
-    """Languages evidenced by the transcript, not only the model's LID tag.
+def language_plausible(tag: str, text: str) -> bool:
+    """Reject hop LID that cannot match the transcript script or lexicon."""
+    name = (tag or "").strip()
+    if not name or name.lower() == "none":
+        return False
+    try:
+        name = canonicalize_language(name) or name
+    except ValueError:
+        return False
+    body = strip_event_prefix(text or "")
+    if not body.strip():
+        return True
+    id_n, en_n = _lang_word_scores(body)
+    if name in _CJK_LANGS:
+        return bool(_CJK_RE.search(body))
+    if name in _ARABIC_LANGS:
+        return bool(_ARABIC_RE.search(body))
+    if _CJK_RE.search(body) and name in {"Indonesian", "Malay", "English"}:
+        return False
+    if name in _ROMANCE_LANGS:
+        if id_n >= 1 and id_n >= en_n:
+            return False
+        return True
+    if name == "Malay" and id_n >= 1:
+        return True
+    if name == "English" and id_n >= 1 and en_n == 0:
+        return False
+    return True
 
-    Qwen3-ASR often emits `language English` on <2 s hops even when the
-    words are Indonesian. Never let that tag be the only signal.
+
+_MIX_FAMILY = frozenset({"English", "Indonesian", "Malay"})
+
+
+def continuation_language(tagged: str, text: str) -> str:
+    """Reuse the model's own LID tag for the next hop prefill.
+
+    Official mix streaming does not force a language and does not replace the
+    model's tag with a lexicon guess. Empty means the next hop runs LID again.
     """
-    tagged = (tagged or "").strip()
-    if tagged.lower() in {"", "none"}:
-        tagged = ""
-    id_n, en_n = _lang_word_scores(strip_event_prefix(text))
+    name = resolve_language_name(tagged)
+    if not name:
+        return ""
+    body = strip_event_prefix(text or "")
+    if not body.strip():
+        return name
+    if language_plausible(name, body):
+        return name
+    if name in _CJK_LANGS and _CJK_RE.search(body):
+        return name
+    if name in _ARABIC_LANGS and _ARABIC_RE.search(body):
+        return name
+    return ""
+
+
+def infer_languages(text: str, tagged: str = "") -> list[str]:
+    """Prefer the model's LID tag; only override English when Indonesian dominates.
+
+    Official mix (`language=None`) identifies language via `language X<asr_text>`.
+    A Latin lexicon must not replace Cantonese/Japanese/Arabic/Spanish tags.
+    """
+    tagged = resolve_language_name(tagged)
+    body = strip_event_prefix(text)
+    id_n, en_n = _lang_word_scores(body)
     out: list[str] = []
-    if id_n >= 2 and id_n > en_n:
+
+    if tagged == "English" and id_n >= 2 and id_n > en_n:
         out.append("Indonesian")
-    elif id_n >= 1 and en_n == 0:
-        # Short Indonesian ("aku mau coba") has a single function word but is
-        # clearly not English — don't let a default English tag win.
-        out.append("Indonesian")
-    if en_n >= 2 and en_n > id_n:
-        out.append("English")
-    elif en_n >= 1 and id_n == 0 and "English" not in out:
-        out.append("English")
-    if id_n >= 1 and en_n >= 1:
+        if en_n >= 1:
+            out.append("English")
+    elif tagged in {"Indonesian", "Malay"}:
+        out.append(tagged)
+        if en_n >= 1 and "English" not in out:
+            out.append("English")
+    elif tagged and language_plausible(tagged, body):
+        out.append(tagged)
+    elif tagged in _CJK_LANGS and _CJK_RE.search(body):
+        out.append(tagged)
+    elif tagged in _ARABIC_LANGS and _ARABIC_RE.search(body):
+        out.append(tagged)
+
+    if not out:
+        if id_n >= 2 and id_n > en_n:
+            out.append("Indonesian")
+        elif id_n >= 1 and en_n == 0:
+            out.append("Indonesian")
+        if en_n >= 2 and en_n > id_n:
+            out.append("English")
+        elif en_n >= 1 and id_n == 0 and "English" not in out:
+            out.append("English")
+        if id_n >= 1 and en_n >= 1:
+            for name in ("Indonesian", "English"):
+                if name not in out:
+                    out.append(name)
+        if not out and _ARABIC_RE.search(body):
+            out.append("Arabic")
+        if not out and _CJK_RE.search(body):
+            out.append("Japanese" if re.search(r"[\u3040-\u30ff]", body) else "Chinese")
+    elif tagged in _MIX_FAMILY and id_n >= 1 and en_n >= 1:
         for name in ("Indonesian", "English"):
             if name not in out:
                 out.append(name)
-    if tagged and tagged not in out:
-        # Trust a non-English tag. Trust English only when the text shows no
-        # Indonesian evidence at all.
-        if tagged != "English" or id_n == 0:
-            out.append(tagged)
-    if not out and tagged:
-        if tagged != "English" or id_n == 0:
-            out.append(tagged)
     return out
 
 
