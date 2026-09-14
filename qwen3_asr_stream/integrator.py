@@ -26,6 +26,7 @@ from .ui import LiveTranscript
 
 
 DEFAULT_BUS_PORT = 18765
+COMMIT_SETTLE_SEC = 0.08
 
 
 class JsonlHub:
@@ -100,13 +101,6 @@ class JsonlHub:
                 self._clients.append(conn)
 
 
-def _same_line(a: str, b: str) -> bool:
-    x, y = (a or "").strip().lower(), (b or "").strip().lower()
-    if not x or not y:
-        return False
-    return x == y or y.startswith(x) or x.startswith(y)
-
-
 def _event_from_raw(raw: str) -> str:
     t = (raw or "").strip()
     if t.startswith("[") and "]" in t:
@@ -144,8 +138,47 @@ class SttPublisher:
         self.ui = ui
         self._last_live = ""
         self._last_commit = ""
+        self._last_commit_uid = -1
         self._last_event = ""
         self._last_emit = 0.0
+        self._commit_lock = threading.Lock()
+        self._pending_commit: Optional[dict] = None
+        self._commit_seq = 0
+        self._refining_uid = -1
+
+    def _queue_commit(self, payload: dict, *, refining: bool) -> None:
+        """Publish only the settled LAST, not the pre-refine draft seal."""
+        uid = int(payload.get("utterance_id") or 0)
+        with self._commit_lock:
+            self._pending_commit = payload
+            self._commit_seq += 1
+            seq = self._commit_seq
+            if refining:
+                self._refining_uid = uid
+                return
+            refined = self._refining_uid == uid
+            if refined:
+                self._refining_uid = -1
+        if refined:
+            self._flush_commit(seq)
+            return
+        timer = threading.Timer(COMMIT_SETTLE_SEC, self._flush_commit, args=(seq,))
+        timer.daemon = True
+        timer.start()
+
+    def _flush_commit(self, seq: int) -> None:
+        with self._commit_lock:
+            if seq != self._commit_seq or self._pending_commit is None:
+                return
+            payload = self._pending_commit
+            self._pending_commit = None
+        text = str(payload.get("text") or "").strip()
+        uid = int(payload.get("utterance_id") or 0)
+        if not text or (uid == self._last_commit_uid and text == self._last_commit):
+            return
+        self._last_commit = text
+        self._last_commit_uid = uid
+        self.hub.publish(payload)
 
     def on_update(self, st: StreamState) -> None:
         finalized = st.finalized or ""
@@ -198,9 +231,8 @@ class SttPublisher:
             self._last_event = ""
         if finalized:
             text = strip_event_prefix(finalized)
-            if has_lexical_speech(text) and not _same_line(self._last_commit, text):
-                self._last_commit = text
-                self.hub.publish(
+            if has_lexical_speech(text):
+                self._queue_commit(
                     {
                         "v": 1,
                         "type": "commit",
@@ -212,10 +244,9 @@ class SttPublisher:
                         "utterance_id": int(st.utterance_id),
                         "ts": time.time(),
                         **extras,
-                    }
+                    },
+                    refining=bool(getattr(st, "refining", False)),
                 )
-            elif has_lexical_speech(text):
-                self._last_commit = text
         if self.ui is not None:
             self.ui.render(st)
         else:
