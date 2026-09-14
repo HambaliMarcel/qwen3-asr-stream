@@ -1,0 +1,4 @@
+# Optional: PANNs CNN6 AudioSet event tagging (CPU-only at runtime).
+# Install: pip install -r requirements-pann.txt
+torch>=2.0
+torchlibrosa>=0.1.0
