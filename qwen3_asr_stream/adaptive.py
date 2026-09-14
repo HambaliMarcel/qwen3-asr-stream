@@ -10,9 +10,9 @@ from .parse import has_lexical_speech
 
 # Prefix-continuation hops finish in ~150 ms on a 7 s window, so the floor
 # can sit well under the old 0.8 s without queueing on the single slot.
-HOP_MIN = 0.50
+HOP_MIN = 0.32
 HOP_MAX = 2.00
-PAUSE_MIN = 1.35
+PAUSE_MIN = 0.45
 PAUSE_MAX = 2.20
 
 
