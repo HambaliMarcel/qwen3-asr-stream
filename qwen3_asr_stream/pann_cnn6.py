@@ -19,6 +19,9 @@ CHECKPOINT_NAME = "Cnn6_mAP=0.343.pth"
 MODEL_SR = 32000
 MIN_SEC = 0.8
 MAX_SEC = 10.0
+# PANNs is a clip-level tagger (trained on ~10 s clips), not a frame VAD.
+# Tag a fixed recent window so cost is constant regardless of utterance length.
+TAG_WINDOW_SEC = 6.0
 
 # Never show or block on ambient/noise tags.
 IGNORE_LABELS = frozenset(
@@ -128,13 +131,25 @@ def _cache_dir() -> Path:
 
 
 def _resample_16k_to_32k(pcm16k: np.ndarray) -> np.ndarray:
+    """Upsample 16 kHz -> 32 kHz with an anti-aliased polyphase filter.
+
+    Official PANNs inference resamples with librosa/soxr. Naive linear
+    interpolation folds imaging artefacts into the speech band (fmax 14 kHz)
+    and measurably degrades clipwise scores, so prefer scipy's polyphase
+    resampler and only fall back to linear when scipy is unavailable.
+    """
     x = np.asarray(pcm16k, dtype=np.float32).reshape(-1)
     if x.size == 0:
         return x
-    n = x.size * 2
-    src = np.arange(x.size, dtype=np.float32)
-    dst = np.linspace(0, x.size - 1, n, dtype=np.float32)
-    return np.interp(dst, src, x).astype(np.float32)
+    try:
+        from scipy.signal import resample_poly
+
+        return resample_poly(x, 2, 1).astype(np.float32)
+    except ImportError:
+        n = x.size * 2
+        src = np.arange(x.size, dtype=np.float32)
+        dst = np.linspace(0, x.size - 1, n, dtype=np.float32)
+        return np.interp(dst, src, x).astype(np.float32)
 
 
 def _short_label(name: str) -> str:
@@ -174,7 +189,9 @@ class PannCnn6Tagger:
         min_score: float = 0.45,
         block_score: float = 0.55,
         companion_score: float = 0.38,
-        speech_score: float = 0.18,
+        # PANNs speech posteriors for clear speech are ~0.8-0.9; anything
+        # below ~0.3 is babble/music bleed. 0.18 vetoed blocking constantly.
+        speech_score: float = 0.35,
         device: str = "cpu",
     ) -> None:
         self.min_score = min_score
@@ -212,7 +229,6 @@ class PannCnn6Tagger:
         checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
         model.load_state_dict(checkpoint["model"])
         model.eval()
-        torch.set_num_threads(1)
         self._model = model
 
     def tag(self, pcm16k: np.ndarray) -> Optional[EventTag]:
@@ -221,6 +237,12 @@ class PannCnn6Tagger:
         x16 = np.asarray(pcm16k, dtype=np.float32).reshape(-1)
         if x16.size < int(MIN_SEC * SAMPLE_RATE * 0.5):
             return None
+        # Fixed recent window: constant inference cost, no growing-utterance
+        # slowdown, and matches clip-tagger training conditions better than
+        # zero-padded short hops or 24 s accumulations.
+        win_n = int(TAG_WINDOW_SEC * SAMPLE_RATE)
+        if x16.size > win_n:
+            x16 = x16[-win_n:]
 
         import torch
 
@@ -266,7 +288,8 @@ class PannCnn6Tagger:
         short = _short_label(best_name)
         has_speech = speech_score >= self.speech_score
 
-        if best_name in COMPANION_LABELS or has_speech:
+        # Companion events (music/singing) are display-only and never block.
+        if best_name in COMPANION_LABELS:
             if best_score < self.companion_score:
                 return None
             return EventTag(
@@ -277,7 +300,12 @@ class PannCnn6Tagger:
                 is_companion=True,
             )
 
-        if best_name in BLOCKING_LABELS and best_score >= self.block_score and not has_speech:
+        # Speech present: let Qwen decide. A clip tagger must not veto or
+        # relabel real speech (e.g. "[dog] hello world" was pure noise).
+        if has_speech:
+            return None
+
+        if best_name in BLOCKING_LABELS and best_score >= self.block_score:
             return EventTag(
                 label=short,
                 score=best_score,
@@ -286,7 +314,7 @@ class PannCnn6Tagger:
                 is_companion=False,
             )
 
-        if best_score >= self.min_score and not has_speech:
+        if best_score >= self.min_score:
             return EventTag(
                 label=short,
                 score=best_score,
@@ -302,7 +330,7 @@ def get_tagger(
     min_score: float = 0.45,
     block_score: float = 0.55,
     companion_score: float = 0.38,
-    speech_score: float = 0.18,
+    speech_score: float = 0.35,
 ) -> Optional[PannCnn6Tagger]:
     if not pann_available():
         return None
