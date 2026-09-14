@@ -8,7 +8,9 @@ from dataclasses import dataclass, field
 from .client import DecodeResult
 from .parse import has_lexical_speech
 
-HOP_MIN = 0.80
+# Prefix-continuation hops finish in ~150 ms on a 7 s window, so the floor
+# can sit well under the old 0.8 s without queueing on the single slot.
+HOP_MIN = 0.50
 HOP_MAX = 2.00
 PAUSE_MIN = 1.35
 PAUSE_MAX = 2.20
@@ -170,10 +172,10 @@ class RuntimeTuner:
     ) -> bool:
         """Whether to run a background LAST seal.
 
-        The seal is prefixed with the live draft and streams tokens, so it is
-        cheap: run it for every real utterance to catch the tail and stabilize
-        the line. Skip only when the tuner disabled refine under load and
-        there is no undecoded tail to rescue.
+        The seal re-decodes the clip in the background and streams tokens.
+        Run it for every real utterance to catch the tail and stabilize the
+        line. Skip only when the tuner disabled refine under load and there
+        is no undecoded tail to rescue.
         """
         lexical = has_lexical_speech(draft)
         if not lexical and utterance_sec < 0.5:
@@ -200,6 +202,8 @@ class RuntimeTuner:
             return 1.40
         if avg_rtf <= 0.12 and avg_lat <= 350:
             return HOP_MIN
+        if avg_rtf <= 0.20 and avg_lat <= 500:
+            return 0.70
         return 1.00
 
     def _retune(self, allow_tag_promote: bool = True) -> None:
