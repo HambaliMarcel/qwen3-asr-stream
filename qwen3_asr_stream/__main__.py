@@ -262,7 +262,43 @@ def build_parser() -> argparse.ArgumentParser:
             "--sound-gate-conf",
             type=float,
             default=None,
-            help="Min confidence 0..1 to skip ASR on non-speech (default 0.50)",
+            help="Min confidence 0..1 to skip ASR on pure non-speech (default 0.62)",
+        )
+        sp.add_argument(
+            "--sound-model",
+            choices=("auto", "pann", "heuristic", "off"),
+            default="auto",
+            help="Sound gate: auto (PANNs CNN6 if installed, else heuristic), pann, heuristic, off",
+        )
+        sp.add_argument(
+            "--pann-interval",
+            type=float,
+            default=None,
+            help="Seconds between PANNs CNN6 event scans (default 1.5)",
+        )
+        sp.add_argument(
+            "--pann-min-score",
+            type=float,
+            default=None,
+            help="Min PANNs score to show an event tag (default 0.45)",
+        )
+        sp.add_argument(
+            "--pann-block-score",
+            type=float,
+            default=None,
+            help="Min score to block ASR for pure events like cough (default 0.55)",
+        )
+        sp.add_argument(
+            "--pann-companion-score",
+            type=float,
+            default=None,
+            help="Min score to show companion tags like music (default 0.38)",
+        )
+        sp.add_argument(
+            "--pann-speech-score",
+            type=float,
+            default=None,
+            help="Speech presence threshold inside PANNs (default 0.18)",
         )
 
     m = sub.add_parser("mic", help="Stream from the Windows microphone")
