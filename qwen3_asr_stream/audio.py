@@ -28,10 +28,18 @@ def resample_16k(audio: np.ndarray, sr: int) -> np.ndarray:
     x = to_mono(audio)
     if sr == SAMPLE_RATE or x.size == 0:
         return x.astype(np.float32, copy=False)
-    n = max(1, int(round(x.size * SAMPLE_RATE / float(sr))))
-    old_idx = np.linspace(0.0, 1.0, x.size, endpoint=False)
-    new_idx = np.linspace(0.0, 1.0, n, endpoint=False)
-    return np.interp(new_idx, old_idx, x).astype(np.float32)
+    try:
+        from math import gcd
+
+        from scipy.signal import resample_poly
+
+        g = gcd(int(sr), SAMPLE_RATE)
+        return resample_poly(x, SAMPLE_RATE // g, int(sr) // g).astype(np.float32)
+    except ImportError:
+        n = max(1, int(round(x.size * SAMPLE_RATE / float(sr))))
+        old_idx = np.linspace(0.0, 1.0, x.size, endpoint=False)
+        new_idx = np.linspace(0.0, 1.0, n, endpoint=False)
+        return np.interp(new_idx, old_idx, x).astype(np.float32)
 
 
 def float_pcm(audio: np.ndarray) -> np.ndarray:
