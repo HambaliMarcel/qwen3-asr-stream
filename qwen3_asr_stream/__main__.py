@@ -23,9 +23,14 @@ def _url(host: str, port: int) -> str:
     return f"http://{host}:{port}"
 
 
+def _lock(cfg: StreamConfig, field: str) -> None:
+    cfg.manual_fields.add(field)
+
+
 def _apply_cli_overrides(cfg: StreamConfig, args: argparse.Namespace) -> StreamConfig:
     if args.hop is not None:
         cfg.hop_sec = float(args.hop)
+        _lock(cfg, "hop_sec")
     if args.unfixed_chunks is not None:
         cfg.unfixed_chunk_num = int(args.unfixed_chunks)
     if args.unfixed_tokens is not None:
@@ -37,14 +42,31 @@ def _apply_cli_overrides(cfg: StreamConfig, args: argparse.Namespace) -> StreamC
     if getattr(args, "language", None) is not None:
         raw_lang = str(args.language).strip().lower()
         cfg.language = canonicalize_language(args.language)
-        if raw_lang in {"mix", "mixed", "campuran", "multi"}:
+        if raw_lang in {"mix", "mixed", "campuran", "multi", "auto", "detect"}:
+            # Auto/mix = multilingual. Never force `language English<asr_text>`.
+            # Official one-lang lock is opt-in via --lid-lock.
             cfg.lid_lock = False
-        elif raw_lang in {"auto", "detect"}:
-            cfg.lid_lock = True
+    if getattr(args, "lid_lock_on", False):
+        cfg.lid_lock = True
+        if getattr(args, "lid_wait", None) is None:
+            cfg.lid_chunk_sec = max(cfg.lid_chunk_sec, 2.0)
+        if getattr(args, "lid_confirm", None) is None:
+            cfg.lid_confirm_chunks = max(cfg.lid_confirm_chunks, 2)
     if args.context:
         cfg.context = args.context
     if args.no_vad:
         cfg.vad = False
+    if getattr(args, "silence_commit", None) is not None:
+        cfg.silence_commit_sec = float(args.silence_commit)
+        _lock(cfg, "silence_commit_sec")
+    if getattr(args, "silence_hangover", None) is not None:
+        cfg.silence_hangover_sec = float(args.silence_hangover)
+        _lock(cfg, "silence_hangover_sec")
+    if getattr(args, "no_refine", False):
+        cfg.refine_on_commit = False
+        _lock(cfg, "refine_on_commit")
+    if getattr(args, "no_auto_tune", False):
+        cfg.auto_tune = False
     if args.no_token_stream:
         cfg.stream_tokens = False
     if getattr(args, "lid_wait", None) is not None:
@@ -59,12 +81,15 @@ def _apply_cli_overrides(cfg: StreamConfig, args: argparse.Namespace) -> StreamC
         cfg.unlock_on_utterance = False
     if getattr(args, "no_sound_gate", False):
         cfg.sound_gate = False
+        _lock(cfg, "sound_gate")
     if getattr(args, "sound_gate_conf", None) is not None:
         cfg.sound_gate_min_conf = float(args.sound_gate_conf)
     if getattr(args, "sound_model", None) is not None:
         cfg.sound_model = str(args.sound_model).strip().lower()
+        _lock(cfg, "sound_model")
     if getattr(args, "pann_interval", None) is not None:
         cfg.pann_interval_sec = float(args.pann_interval)
+        _lock(cfg, "pann_interval_sec")
     if getattr(args, "pann_min_score", None) is not None:
         cfg.pann_min_score = float(args.pann_min_score)
     if getattr(args, "pann_block_score", None) is not None:
@@ -84,7 +109,9 @@ def cmd_devices(_: argparse.Namespace) -> int:
 
 
 def cmd_languages(_: argparse.Namespace) -> int:
-    print("Default is auto-detect. Lock one with --language <name>.")
+    print("Default is multilingual auto-detect (no language is forced).")
+    print("Force one language with --language Indonesian (or English, Chinese, ...).")
+    print("Official one-language-per-sentence lock: --lid-lock")
     print("Supported:")
     for name in SUPPORTED_LANGUAGES:
         print(f"  {name}")
@@ -155,12 +182,15 @@ def cmd_mic(args: argparse.Namespace) -> int:
     client = _connect(args)
     ui = LiveTranscript()
     engine = StreamingAsr(client, cfg, on_update=ui.render)
-    lang_label = cfg.language or ("MIX · code-switch" if not cfg.lid_lock else "AUTO · lock per sentence")
+    lang_label = cfg.language or (
+        "MIX · multilingual" if not cfg.lid_lock else "LOCK · one language per sentence"
+    )
     sealed = ""
     try:
+        mode = "auto-tune" if cfg.auto_tune else "fixed"
         ui.banner(
             "Qwen3-ASR  ·  live multilingual stream",
-            f"{_url(args.host, args.port)}   {args.profile}   hop {cfg.hop_sec:.2f}s   {lang_label}",
+            f"{_url(args.host, args.port)}   {args.profile} · {mode}   hop {cfg.hop_sec:.2f}s   {lang_label}",
         )
         with MicStream(device=args.device, block_ms=20) as mic:
             while True:
@@ -168,7 +198,7 @@ def cmd_mic(args: argparse.Namespace) -> int:
                 if pcm.size:
                     engine.push(pcm)
     except KeyboardInterrupt:
-        sealed = engine.commit() or engine.state.text or engine.state.unfixed
+        sealed = engine.commit(wait=True) or engine.state.text or engine.state.unfixed
     finally:
         ui.close(sealed)
     return 0
@@ -190,9 +220,10 @@ def cmd_file(args: argparse.Namespace) -> int:
     client = _connect(args)
     ui = LiveTranscript()
     engine = StreamingAsr(client, cfg, on_update=ui.render)
+    mode = "auto-tune" if cfg.auto_tune else "fixed"
     ui.banner(
         "Qwen3-ASR  ·  file stream",
-        f"{path.name}  {pcm.size / SAMPLE_RATE:.1f}s  profile={args.profile}  hop={cfg.hop_sec:.2f}s",
+        f"{path.name}  {pcm.size / SAMPLE_RATE:.1f}s  {args.profile} · {mode}  hop={cfg.hop_sec:.2f}s",
     )
     hop = int(round(cfg.hop_sec * SAMPLE_RATE))
     pos = 0
@@ -209,9 +240,9 @@ def cmd_file(args: argparse.Namespace) -> int:
                 if delay > 0:
                     time.sleep(delay)
             engine.push(chunk)
-        sealed = engine.commit()
+        sealed = engine.commit(wait=True)
     except KeyboardInterrupt:
-        sealed = engine.commit()
+        sealed = engine.commit(wait=True)
     finally:
         ui.close(sealed)
     return 0
@@ -245,7 +276,12 @@ def build_parser() -> argparse.ArgumentParser:
     lg.set_defaults(func=cmd_languages)
 
     def add_stream_flags(sp: argparse.ArgumentParser) -> None:
-        sp.add_argument("--profile", choices=("ultralow", "balanced", "official", "paper"), default="ultralow")
+        sp.add_argument(
+            "--profile",
+            choices=("auto", "ultralow", "balanced", "official", "paper"),
+            default="auto",
+            help="auto (default) adapts hop/pause/refine/tags while running",
+        )
         sp.add_argument("--hop", type=float, default=None, help="Audio hop seconds (default from profile)")
         sp.add_argument("--unfixed-chunks", type=int, default=None)
         sp.add_argument("--unfixed-tokens", type=int, default=None)
@@ -254,16 +290,44 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument(
             "--language",
             default="mix",
-            help="mix (default, campur Indo/English in one line), auto (lock one lang per sentence), or force Indonesian/English/...",
+            help="mix/auto (default): multilingual, no forced language. Or force Indonesian/English/...",
         )
         sp.add_argument("--lid-wait", type=float, default=None, help="Seconds of speech before first LID (official 2.0)")
         sp.add_argument("--lid-confirm", type=int, default=None, help="Open 2s chunks before lock (SDK 2, paper 4)")
         sp.add_argument("--relid-after", type=float, default=None, help="Re-open LID after this many silent seconds (default 8)")
-        sp.add_argument("--no-lid-lock", action="store_true", help="Never lock; re-guess every chunk (not recommended)")
-        sp.add_argument("--keep-lock", action="store_true", help="Keep language lock across sentences (old session behavior)")
+        sp.add_argument(
+            "--lid-lock",
+            dest="lid_lock_on",
+            action="store_true",
+            help="Official mode: lock ONE language per sentence (can bias to English on short hops)",
+        )
+        sp.add_argument("--no-lid-lock", action="store_true", help="Never force a language tag (same as default mix/auto)")
+        sp.add_argument("--keep-lock", action="store_true", help="Keep language lock across sentences (only with --lid-lock)")
         sp.add_argument("--context", default="", help="Optional biasing context (system prompt)")
         sp.add_argument("--no-vad", action="store_true")
         sp.add_argument("--vad", action="store_true")
+        sp.add_argument(
+            "--silence-commit",
+            type=float,
+            default=None,
+            help="Seconds of trailing silence before LAST refine (default 1.5)",
+        )
+        sp.add_argument(
+            "--silence-hangover",
+            type=float,
+            default=None,
+            help="Ignore brief energy dips shorter than this before counting silence (default 0.45)",
+        )
+        sp.add_argument(
+            "--no-refine",
+            action="store_true",
+            help="Disable background LAST refine (disables auto-tune for refine)",
+        )
+        sp.add_argument(
+            "--no-auto-tune",
+            action="store_true",
+            help="Disable runtime auto-tuning (advanced)",
+        )
         sp.add_argument("--no-token-stream", action="store_true")
         sp.add_argument(
             "--no-sound-gate",
@@ -279,8 +343,8 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument(
             "--sound-model",
             choices=("auto", "pann", "heuristic", "off"),
-            default="auto",
-            help="Sound gate: auto (PANNs CNN6 if installed, else heuristic), pann, heuristic, off",
+            default=None,
+            help="Force sound tagging mode (default: runtime auto picks best)",
         )
         sp.add_argument(
             "--pann-interval",
@@ -310,7 +374,7 @@ def build_parser() -> argparse.ArgumentParser:
             "--pann-speech-score",
             type=float,
             default=None,
-            help="Speech presence threshold inside PANNs (default 0.18)",
+            help="Speech presence threshold inside PANNs (default 0.35)",
         )
 
     m = sub.add_parser("mic", help="Stream from the Windows microphone")
