@@ -7,5 +7,5 @@ try { chcp 65001 | Out-Null } catch {}
 $OutputEncoding = [Console]::OutputEncoding
 $Host.UI.RawUI.WindowTitle = "Qwen3-ASR  live"
 
-# Default: auto language (not English). Pass extra args to override.
-python -m qwen3_asr_stream mic --language auto @args
+# Default: multilingual auto-detect (do not lock English).
+python -m qwen3_asr_stream mic @args
