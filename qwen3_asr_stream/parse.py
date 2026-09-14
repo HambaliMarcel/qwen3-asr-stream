@@ -307,6 +307,152 @@ def classify_sound_event_text(text: str) -> Optional[str]:
     return None
 
 
+# Short-hop LID in Qwen3-ASR is English-heavy. Use function words in the
+# transcript to correct a clearly wrong tag (not to force a language).
+_ID_WORDS = frozenset(
+    {
+        "yang",
+        "dan",
+        "saya",
+        "aku",
+        "kamu",
+        "anda",
+        "tidak",
+        "bukan",
+        "sudah",
+        "bisa",
+        "untuk",
+        "dengan",
+        "ini",
+        "itu",
+        "ada",
+        "dari",
+        "kita",
+        "kami",
+        "mereka",
+        "kalau",
+        "kalo",
+        "jadi",
+        "tapi",
+        "atau",
+        "karena",
+        "mau",
+        "nggak",
+        "ngga",
+        "gak",
+        "dong",
+        "sih",
+        "lah",
+        "kok",
+        "deh",
+        "udah",
+        "aja",
+        "banget",
+        "buat",
+        "biar",
+        "apa",
+        "siapa",
+        "mana",
+        "kenapa",
+        "gimana",
+        "bagaimana",
+        "terus",
+        "lalu",
+        "sekarang",
+        "nanti",
+        "tadi",
+        "besok",
+        "kemarin",
+        "tolong",
+        "coba",
+        "ngomong",
+        "iya",
+        "yaudah",
+        "pak",
+        "bu",
+        "mas",
+        "mbak",
+    }
+)
+_EN_WORDS = frozenset(
+    {
+        "the",
+        "and",
+        "you",
+        "are",
+        "this",
+        "that",
+        "with",
+        "from",
+        "have",
+        "what",
+        "when",
+        "will",
+        "just",
+        "like",
+        "they",
+        "them",
+        "your",
+        "about",
+        "would",
+        "could",
+        "should",
+        "there",
+        "their",
+        "been",
+        "were",
+        "going",
+        "gonna",
+        "don't",
+        "isn't",
+    }
+)
+_WORD_RE = re.compile(r"[A-Za-zÀ-ÿ']+")
+
+
+def _lang_word_scores(text: str) -> tuple[int, int]:
+    words = [w.lower().replace("'", "") for w in _WORD_RE.findall(text or "")]
+    id_n = sum(1 for w in words if w in _ID_WORDS)
+    en_n = sum(1 for w in words if w in _EN_WORDS)
+    return id_n, en_n
+
+
+def infer_languages(text: str, tagged: str = "") -> list[str]:
+    """Languages evidenced by the transcript, not only the model's LID tag.
+
+    Qwen3-ASR often emits `language English` on <2 s hops even when the
+    words are Indonesian. Never let that tag be the only signal.
+    """
+    tagged = (tagged or "").strip()
+    if tagged.lower() in {"", "none"}:
+        tagged = ""
+    id_n, en_n = _lang_word_scores(strip_event_prefix(text))
+    out: list[str] = []
+    if id_n >= 2 and id_n > en_n:
+        out.append("Indonesian")
+    elif id_n >= 1 and en_n == 0:
+        # Short Indonesian ("aku mau coba") has a single function word but is
+        # clearly not English — don't let a default English tag win.
+        out.append("Indonesian")
+    if en_n >= 2 and en_n > id_n:
+        out.append("English")
+    elif en_n >= 1 and id_n == 0 and "English" not in out:
+        out.append("English")
+    if id_n >= 1 and en_n >= 1:
+        for name in ("Indonesian", "English"):
+            if name not in out:
+                out.append(name)
+    if tagged and tagged not in out:
+        # Trust a non-English tag. Trust English only when the text shows no
+        # Indonesian evidence at all.
+        if tagged != "English" or id_n == 0:
+            out.append(tagged)
+    if not out and tagged:
+        if tagged != "English" or id_n == 0:
+            out.append(tagged)
+    return out
+
+
 def merge_languages(langs: list[str]) -> str:
     out: list[str] = []
     prev = None
