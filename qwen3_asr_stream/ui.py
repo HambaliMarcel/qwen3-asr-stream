@@ -67,6 +67,23 @@ def _width() -> int:
     return max(72, min(110, shutil.get_terminal_size((100, 28)).columns - 1))
 
 
+def _heights() -> tuple[int, int]:
+    """Visible rows for the LIVE and LAST boxes.
+
+    Fixed chrome is ~10 rows (title + session box + headers + footer), so the
+    rest of the window goes to text. Taller terminals fit long sentences
+    without truncating; short ones keep the old minimums.
+    """
+    try:
+        rows = shutil.get_terminal_size((100, 28)).lines
+    except Exception:
+        rows = 28
+    content = max(9, rows - 12)
+    live = max(6, min(12, round(content * 0.6)))
+    last = max(5, min(10, content - live))
+    return live, last
+
+
 def _visible_len(s: str) -> int:
     return len(re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", s))
 
@@ -96,8 +113,9 @@ def _pad_row(inner: str, width: int) -> str:
 
 
 def _wrap(text: str, width: int, limit: int) -> list[str]:
+    """Wrap to `limit` rows, keeping the *tail* — newest words stay visible."""
     if not text:
-        return [""]
+        return [""] * max(1, limit)
     lines: list[str] = []
     buf = ""
     for ch in text:
@@ -109,15 +127,14 @@ def _wrap(text: str, width: int, limit: int) -> list[str]:
         if len(buf) >= width:
             lines.append(buf)
             buf = ""
-        if len(lines) >= limit:
-            break
-    if buf and len(lines) < limit:
+    if buf:
         lines.append(buf)
     if not lines:
         lines = [""]
+    lines = lines[-limit:]
     while len(lines) < limit:
         lines.append("")
-    return lines[:limit]
+    return lines
 
 
 def _meter(level: float, width: int = 16) -> str:
@@ -136,10 +153,10 @@ def _meter(level: float, width: int = 16) -> str:
     return "".join(cells)
 
 
-def _paint_words(stable: str, live: str) -> str:
+def _paint_words(stable: str, live: str, empty_hint: str = "listening…") -> str:
     """White stable words + bright live tail + block caret."""
     if not stable and not live:
-        return f"{DIM}{ITALIC}identifying… keep talking{RESET}"
+        return f"{DIM}{ITALIC}{empty_hint}{RESET}"
     parts: list[str] = []
     if stable:
         parts.append(f"{WHITE}{stable}{RESET}")
@@ -160,8 +177,12 @@ def _paint_words(stable: str, live: str) -> str:
 
 
 def _split_stable_live(committed: str, unfixed: str, prev_unfixed: str) -> tuple[str, str]:
-    text = unfixed or committed or ""
+    # LIVE shows only the current window. Text already batched into LAST
+    # (`committed`) must never be repainted here — that is the LIVE == LAST echo.
+    text = unfixed or ""
     committed = committed or ""
+    if not text:
+        return "", ""
     if committed and text.startswith(committed):
         return committed, text[len(committed) :].lstrip()
     # Common prefix with the previous paint — already-shown words go stable.
@@ -319,7 +340,14 @@ class LiveTranscript:
             f"{GRAY}dec{RESET} {WHITE}{dec}{RESET}"
         )
         meter = _meter(st.level, 18)
-        live_painted = _paint_words(stable, live)
+        ev = getattr(st, "event_label", "")
+        if st.committed:
+            empty_hint = "… next line"
+        elif st.speaking or st.speech_seen:
+            empty_hint = f"[{ev}] hearing sound, waiting for words" if ev else "hearing sound, waiting for words"
+        else:
+            empty_hint = "listening…"
+        live_painted = _paint_words(stable, live, empty_hint)
         last_body = self._last_result or f"{DIM}committed line appears here after a short pause{RESET}"
         last_lang = (self._last_lang or shown) if self._last_result else ""
 
@@ -334,10 +362,11 @@ class LiveTranscript:
         def row(content: str) -> str:
             return f"{CYAN}│{RESET}{_pad_row(content, inner)}{CYAN}│{RESET}"
 
-        live_lines = _wrap_ansi(live_painted, inner - 2, 4)
-        last_lines = _wrap(self._last_result or "", inner - 2, 3)
+        live_n, last_n = _heights()
+        live_lines = _wrap_ansi(live_painted, inner - 2, live_n)
+        last_lines = _wrap(self._last_result or "", inner - 2, last_n)
         if not self._last_result:
-            last_lines = _wrap_ansi(last_body, inner - 2, 3)
+            last_lines = _wrap_ansi(last_body, inner - 2, last_n)
 
         adapt = getattr(st, "adapt_hint", "")
         adapt_s = f"   {GRAY}{adapt}{RESET}" if adapt else ""
@@ -384,29 +413,33 @@ class LiveTranscript:
 def _wrap_ansi(text: str, width: int, limit: int) -> list[str]:
     if not text:
         return [""] * limit
-    # wrap on visible characters, keep escape sequences attached
+    # Wrap on visible characters, keep escape sequences attached, and keep
+    # the *tail* so the newest words are always on screen. The active colour
+    # is re-applied at the start of each continuation row.
     lines: list[str] = []
     cur = ""
     vis = 0
     i = 0
-    while i < len(text) and len(lines) < limit:
+    active = ""
+    while i < len(text):
         if text[i] == "\x1b":
             m = re.match(r"\x1b\[[0-9;]*[A-Za-z]", text[i:])
             if m:
-                cur += m.group(0)
-                i += len(m.group(0))
+                seq = m.group(0)
+                cur += seq
+                active = "" if seq == RESET else active + seq
+                i += len(seq)
                 continue
         cur += text[i]
         vis += 1
         i += 1
         if vis >= width:
             lines.append(cur + RESET)
-            cur = ""
+            cur = active
             vis = 0
-    if cur and len(lines) < limit:
+    if vis > 0 or not lines:
         lines.append(cur)
-    if not lines:
-        lines = [""]
+    lines = lines[-limit:]
     while len(lines) < limit:
         lines.append("")
-    return lines[:limit]
+    return lines
