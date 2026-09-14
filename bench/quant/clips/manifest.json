@@ -1,0 +1,41 @@
+{
+  "clips": [
+    {
+      "id": "official_zh",
+      "file": "asr_zh.wav",
+      "url": "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-ASR-Repo/asr_zh.wav",
+      "expected_lang": "Chinese",
+      "reference": "甚至出现交易几乎停滞的情况。"
+    },
+    {
+      "id": "official_en",
+      "file": "asr_en.wav",
+      "url": "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-ASR-Repo/asr_en.wav",
+      "expected_lang": "English",
+      "reference": ""
+    },
+    {
+      "id": "librispeech_quilter",
+      "file": "librispeech_mr_quilter.wav",
+      "url": "https://huggingface.co/datasets/bezzam/audio_samples/resolve/main/librispeech_mr_quilter.wav",
+      "expected_lang": "English",
+      "reference": "Mr. Quilter is the apostle of the middle classes and we are glad to welcome his gospel."
+    },
+    {
+      "id": "whisper_jfk",
+      "file": "jfk.wav",
+      "url": "https://github.com/ggerganov/whisper.cpp/raw/master/samples/jfk.wav",
+      "expected_lang": "English",
+      "reference": "And so my fellow Americans ask not what your country can do for you ask what you can do for your country."
+    }
+  ],
+  "probe_urls": [
+    "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-ASR-Repo/asr_ja.wav",
+    "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-ASR-Repo/asr_yue.wav",
+    "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-ASR-Repo/asr_ko.wav",
+    "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-ASR-Repo/asr_id.wav",
+    "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-ASR-Repo/asr_ar.wav",
+    "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-ASR-Repo/asr_es.wav",
+    "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-ASR-Repo/asr_de.wav"
+  ]
+}
