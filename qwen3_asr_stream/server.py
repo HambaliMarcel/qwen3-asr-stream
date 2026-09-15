@@ -13,7 +13,9 @@ from .client import LlamaAsrClient, LlamaServerError
 
 DEFAULT_LLAMA_DIR = Path(r"C:\AI\llama.cpp")
 DEFAULT_MODELS_DIR = Path(r"C:\AI\models")
-DEFAULT_MODEL = "Qwen3-ASR-1.7B-Q8_0.gguf"
+# Q4_K_M: same VRAM class as Q4_0, far fewer decoder loops on sung input.
+DEFAULT_MODEL = "Qwen3-ASR-1.7B-Q4_K_M.gguf"
+FALLBACK_MODEL = "Qwen3-ASR-1.7B-Q4_0.gguf"
 DEFAULT_MMPROJ = "mmproj-Qwen3-ASR-1.7B-Q8_0.gguf"
 DEFAULT_PORT = 9999
 
@@ -32,10 +34,16 @@ def resolve_paths(
     if exe.is_dir():
         exe = exe / "llama-server.exe"
     models = _env_path("QWEN_ASR_MODELS_DIR", DEFAULT_MODELS_DIR)
-    model_p = Path(model) if model else Path(os.environ.get("QWEN_ASR_MODEL") or (models / DEFAULT_MODEL))
+    default_p = models / DEFAULT_MODEL
+    if not default_p.is_file() and (models / FALLBACK_MODEL).is_file():
+        default_p = models / FALLBACK_MODEL
+    model_p = Path(model) if model else Path(os.environ.get("QWEN_ASR_MODEL") or default_p)
     mmproj_p = Path(mmproj) if mmproj else Path(os.environ.get("QWEN_ASR_MMPROJ") or (models / DEFAULT_MMPROJ))
     if not model_p.is_file() and (models / model_p.name).is_file():
         model_p = models / model_p.name
+    if model_p.name == "qwen3-asr-1.7b-q4_0.gguf" and default_p.is_file():
+        # cstr's GGUF is a CrispASR arch (`qwen3asr`) llama.cpp cannot load.
+        model_p = default_p
     if not mmproj_p.is_file() and (models / mmproj_p.name).is_file():
         mmproj_p = models / mmproj_p.name
     return exe, model_p, mmproj_p
