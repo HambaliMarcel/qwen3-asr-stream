@@ -19,7 +19,11 @@ Write-Host "port         $port"
   -m $model `
   --mmproj $mmproj `
   -ngl 99 `
-  -c 4096 `
+  -c 1536 `
+  -ctk q8_0 `
+  -ctv q8_0 `
+  -b 512 `
+  -ub 256 `
   -np 1 `
   -n 32 `
   --temp 0.01 `

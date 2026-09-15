@@ -262,7 +262,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--model", default=os.environ.get("QWEN_ASR_MODEL"))
     p.add_argument("--mmproj", default=os.environ.get("QWEN_ASR_MMPROJ"))
     p.add_argument("--ngl", type=int, default=99)
-    p.add_argument("--ctx", type=int, default=4096)
+    p.add_argument("--ctx", type=int, default=1536)
     p.add_argument("--start-server", "--serve-with", dest="start_server", action="store_true")
     p.add_argument("--serve", action="store_true", help=argparse.SUPPRESS)
 

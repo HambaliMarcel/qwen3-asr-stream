@@ -55,7 +55,7 @@ def build_server_cmd(
     model: Optional[str] = None,
     mmproj: Optional[str] = None,
     ngl: int = 99,
-    ctx: int = 4096,
+    ctx: int = 1536,
     extra: Optional[list[str]] = None,
 ) -> list[str]:
     exe, model_p, mmproj_p = resolve_paths(llama_server, model, mmproj)
@@ -76,6 +76,16 @@ def build_server_cmd(
         str(ngl),
         "-c",
         str(ctx),
+        # 20 s seal ≈ 250 audio + 256 text tokens, so 1536 is plenty; q8 KV
+        # and a smaller batch trim ~150 MB VRAM at identical hop latency.
+        "-ctk",
+        "q8_0",
+        "-ctv",
+        "q8_0",
+        "-b",
+        "512",
+        "-ub",
+        "256",
         "-np",
         "1",
         "-n",
