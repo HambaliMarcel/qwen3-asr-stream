@@ -43,11 +43,18 @@ MID_CUT_GAP_SEC = 0.15
 # A window that has produced no words yet (beat intro, hush the VAD let
 # through) is trimmed to this much audio so `language None` can never lock it.
 IDLE_TRIM_SEC = 1.0
+# Live hops only write the new tail after the prefill, so they never need a
+# long budget. A runaway loop is what used to fill 150+ tokens per hop.
+LIVE_MAX_TOKENS_CAP = 128
+# After a loop is caught, send DRY sampling for this long so the decoder does
+# not spiral again on the same beat.
+ANTI_LOOP_SEC = 8.0
 
 from .audio import SAMPLE_RATE
-from .client import DecodeResult, LlamaAsrClient
+from .client import DecodeResult, LlamaAsrClient, StopDecode
 from .parse import (
     classify_sound_event_text,
+    collapse_loops,
     combine_event_and_transcript,
     continuation_language,
     has_lexical_speech,
@@ -244,6 +251,8 @@ class StreamState:
     adapt_hint: str = ""
     tune_hop_sec: float = 0.0
     tune_pause_sec: float = 0.0
+    # Decoder spirals ("black on black on …") caught and cut this session.
+    loop_hits: int = 0
 
     @property
     def display_text(self) -> str:
@@ -271,6 +280,7 @@ class StreamingAsr:
         self._refine_thread: Optional[threading.Thread] = None
         self._last_commit_at = 0.0
         self._last_commit_silence = 0.0
+        self._last_loop_at = 0.0
         self._tuner = RuntimeTuner.from_config(cfg)
         self._sound_model_live: object = None
         self._sync_pann_model()
@@ -473,15 +483,18 @@ class StreamingAsr:
                 self.reset_utterance(keep_tail=False, unlock=unlock)
             self._emit()
 
-    def _cut_window(self) -> None:
+    def _cut_window(self, flush: bool = True, min_words: int = 0) -> None:
         """Seal the current LIVE window into LAST and start a fresh one.
 
         No audio is carried over, so the next window can never re-transcribe
         (echo) words that are already in LAST.
         """
         st = self.state
-        self._flush_buffer_decode()
+        if flush:
+            self._flush_buffer_decode()
         seg = strip_event_prefix(st.text or "")
+        if min_words and len(seg.split()) < min_words:
+            seg = ""
         if has_lexical_speech(seg):
             if self._seal_alive():
                 # An older seal must not paint its paragraph over this one.
@@ -925,6 +938,11 @@ class StreamingAsr:
 
         def on_partial(lang: str, text: str) -> None:
             _, clean = parse_asr_output(text, user_language=force or None)
+            clean, looped = collapse_loops(clean)
+            if looped:
+                # Stop paying for the rest of the loop; the final result is
+                # collapsed again below and the window is reset.
+                raise StopDecode()
             if classify_sound_event_text(clean) and not has_lexical_speech(clean):
                 st.sound_label = classify_sound_event_text(clean) or ""
                 st.unfixed = f"[{st.sound_label}]"
@@ -950,13 +968,14 @@ class StreamingAsr:
                 "mix" if has_lexical_speech(st.unfixed or st.text) else "guessing"
             )
         self._emit()
+        anti_loop = (time.monotonic() - self._last_loop_at) < ANTI_LOOP_SEC
         try:
             result = self.client.transcribe(
                 audio,
                 raw_prefix=prefix,
                 context=self.cfg.context,
                 force_language=force,
-                max_tokens=self._token_budget(audio, self.cfg.max_tokens, 384),
+                max_tokens=self._token_budget(audio, self.cfg.max_tokens, LIVE_MAX_TOKENS_CAP),
                 temperature=self.cfg.temperature,
                 on_partial=on_partial if self.cfg.stream_tokens else None,
                 prefill_language=(
@@ -964,11 +983,24 @@ class StreamingAsr:
                     if st.window_lang and language_plausible(st.window_lang, prev_clean)
                     else None
                 ),
+                anti_loop=anti_loop,
             )
         finally:
             st.decoding = False
 
         _, clean = parse_asr_output(result.text, user_language=force or None)
+        clean, looped = collapse_loops(clean)
+        if looped:
+            # Decoder spiral ("black on black on …"). Keep the words before the
+            # loop, drop the audio that produced it, and start a fresh window
+            # so the continuation prefill cannot carry the loop forward.
+            st.loop_hits += 1
+            self._last_loop_at = time.monotonic()
+            st.last = result
+            st.text = self._with_event(clean) if has_lexical_speech(clean) else ""
+            st.unfixed = st.text
+            self._cut_window(flush=False, min_words=6)
+            return
         if has_lexical_speech(clean):
             st.sound_label = ""
             st.non_speech_only = False

@@ -331,6 +331,7 @@ class LiveTranscript:
         rtf = f"{st.last.rtf:.2f}×" if st.last else "—"
         acc = f"{st.audio_accum.size / 16000.0:.1f}s"
         dec = f"{st.last.audio_sec:.1f}s" if st.last else "—"
+        loops = int(getattr(st, "loop_hits", 0) or 0)
 
         top = (
             f" {status}  {lang}   {GRAY}hop{RESET} {WHITE}{hop}{RESET}  "
@@ -338,6 +339,7 @@ class LiveTranscript:
             f"{GRAY}rtf{RESET} {WHITE}{rtf}{RESET}  "
             f"{GRAY}acc{RESET} {WHITE}{acc}{RESET}  "
             f"{GRAY}dec{RESET} {WHITE}{dec}{RESET}"
+            + (f"  {GRAY}loops cut{RESET} {WHITE}{loops}{RESET}" if loops else "")
         )
         meter = _meter(st.level, 18)
         ev = getattr(st, "event_label", "")
