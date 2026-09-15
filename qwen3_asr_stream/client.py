@@ -19,6 +19,20 @@ class LlamaServerError(RuntimeError):
     pass
 
 
+class StopDecode(Exception):
+    """Raised by an on_partial callback to abort a streaming decode early."""
+
+
+# Only sent while the decoder was recently caught looping. DRY leaves short
+# hooks alone (allowed_length) and stops runaway "x on x on x" tails.
+ANTI_LOOP_SAMPLING = {
+    "dry_multiplier": 0.8,
+    "dry_base": 1.75,
+    "dry_allowed_length": 6,
+    "dry_penalty_last_n": 256,
+}
+
+
 @dataclass
 class DecodeResult:
     raw: str
@@ -303,7 +317,12 @@ class LlamaAsrClient:
                         delta = (choices[0].get("delta") or {}).get("content") or ""
                         if delta:
                             pieces.append(delta)
-                            on_partial("".join(pieces))
+                            try:
+                                on_partial("".join(pieces))
+                            except StopDecode:
+                                # Closing the response cancels the server-side
+                                # decode, so a loop stops costing GPU time now.
+                                return "".join(pieces)
         except HTTPError as e:
             body = e.read().decode("utf-8", errors="replace")
             raise LlamaServerError(f"/v1/chat/completions HTTP {e.code}: {body[:800]}") from e
