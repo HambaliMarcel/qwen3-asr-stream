@@ -662,13 +662,15 @@ class StreamingAsr:
     ) -> str:
         """LAST seal: one full-window decode (no prefix) of the finished segment."""
         body = strip_event_prefix(seg)
-        max_tok = self._token_budget(audio, SEAL_MAX_TOKENS, 512)
+        max_tok = self._token_budget(audio, SEAL_MAX_TOKENS, 256)
 
         def on_partial(_lang: str, text: str) -> None:
             if gen != self._refine_gen:
                 return
             _, clean = parse_asr_output(text, user_language=self.cfg.language)
             clean = strip_event_prefix(clean)
+            if collapse_loops(clean)[1]:
+                raise StopDecode()
             if not clean.strip():
                 return
             dw, cw = body.split(), clean.split()
@@ -688,6 +690,10 @@ class StreamingAsr:
         )
         _, clean = parse_asr_output(result.text, user_language=self.cfg.language)
         clean = strip_event_prefix(clean)
+        clean, looped = collapse_loops(clean)
+        if looped:
+            # A looping seal is worse than the live draft it would replace.
+            return seg
         if has_lexical_speech(clean):
             return clean
         return seg
