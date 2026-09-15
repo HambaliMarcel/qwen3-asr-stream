@@ -15,7 +15,7 @@ Long speech (rap, monologue) is **batched**: at a breath gap (~0.35 s after ≥6
 
 - Windows 10/11, Python 3.10+
 - [llama.cpp](https://github.com/ggerganov/llama.cpp) `llama-server.exe` with `--prefill-assistant` and `--cache-prompt`
-- Qwen3-ASR GGUF + matching `mmproj` (e.g. `Qwen3-ASR-1.7B-Q8_0.gguf`)
+- Qwen3-ASR GGUF + matching `mmproj` (e.g. `Qwen3-ASR-1.7B-Q4_K_M.gguf` + `mmproj-Qwen3-ASR-1.7B-Q8_0.gguf`; prefer K-quants over legacy Q4_0 — the Q4_0 decoder spirals into repeats on sung input). The stream has a loop guard: a repeated n-gram in the partial text aborts that decode, the window is reset, and DRY sampling is sent for the next ~8 s.
 
 ```powershell
 python -m pip install -r requirements.txt
