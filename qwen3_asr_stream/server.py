@@ -101,6 +101,14 @@ def build_server_cmd(
         "--jinja",
         "--prefill-assistant",
         "--cache-prompt",
+        # Every hop is a new audio prompt, so the host-RAM prompt cache only
+        # adds a KV copy per hop; in-slot reuse is what actually helps.
+        "--cache-ram",
+        "0",
+        # No mmap: keeps the weights out of the file page cache so Windows
+        # does not evict and re-read them from SSD mid-session.
+        "--load-mode",
+        "none",
         "--mmproj-offload",
         "--no-webui",
     ]

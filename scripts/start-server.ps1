@@ -33,5 +33,7 @@ Write-Host "port         $port"
   --jinja `
   --prefill-assistant `
   --cache-prompt `
+  --cache-ram 0 `
+  --load-mode none `
   --mmproj-offload `
   --no-webui
