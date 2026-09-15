@@ -162,6 +162,7 @@ class LlamaAsrClient:
         max_tokens: int,
         temperature: float,
         style: str,
+        anti_loop: bool = False,
     ) -> str:
         payload = {
             "messages": self._messages(wav_b64, prefill, context, style),
@@ -174,6 +175,8 @@ class LlamaAsrClient:
             # prefix across continuation decodes within one utterance window.
             "cache_prompt": True,
         }
+        if anti_loop:
+            payload.update(ANTI_LOOP_SAMPLING)
         _, body = self._request("/v1/chat/completions", payload)
         data = json.loads(body.decode("utf-8"))
         choices = data.get("choices") or []
@@ -192,6 +195,7 @@ class LlamaAsrClient:
         temperature: float = 0.01,
         on_partial: Optional[Callable[[str, str], None]] = None,
         prefill_language: Optional[str] = None,
+        anti_loop: bool = False,
     ) -> DecodeResult:
         """One decode of `pcm`.
 
@@ -231,13 +235,16 @@ class LlamaAsrClient:
                             on_partial=lambda delta_raw: _emit_partial(
                                 on_partial, raw_prefix, delta_raw, force_language
                             ),
+                            anti_loop=anti_loop,
                         )
                     except LlamaServerError:
                         gen = self._chat_once(
-                            wav_b64, prefill, context, max_tokens, temperature, style
+                            wav_b64, prefill, context, max_tokens, temperature, style, anti_loop
                         )
                 else:
-                    gen = self._chat_once(wav_b64, prefill, context, max_tokens, temperature, style)
+                    gen = self._chat_once(
+                        wav_b64, prefill, context, max_tokens, temperature, style, anti_loop
+                    )
                 self._audio_style = style
                 last_err = None
                 break
@@ -273,6 +280,7 @@ class LlamaAsrClient:
         temperature: float,
         style: str,
         on_partial: Callable[[str], None],
+        anti_loop: bool = False,
     ) -> str:
         payload = {
             "messages": self._messages(wav_b64, prefill, context, style),
@@ -283,6 +291,8 @@ class LlamaAsrClient:
             "stream": True,
             "cache_prompt": True,
         }
+        if anti_loop:
+            payload.update(ANTI_LOOP_SAMPLING)
         data = json.dumps(payload).encode("utf-8")
         req = Request(
             self.base_url + "/v1/chat/completions",
