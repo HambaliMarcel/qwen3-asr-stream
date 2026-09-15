@@ -186,6 +186,58 @@ def detect_and_fix_repetitions(text: str, threshold: int = 20) -> str:
     return text
 
 
+_LOOP_MAX_NGRAM = 8
+_LOOP_MIN_REPEATS = 4
+# "na na na na na" is a normal hook; only a longer run of one word is a spiral.
+_LOOP_MIN_REPEATS_1GRAM = 6
+_LOOP_NORM_RE = re.compile(r"[\s,.!?;:…\-\"'`]+")
+
+
+def _loop_norm(word: str) -> str:
+    return _LOOP_NORM_RE.sub("", word.lower())
+
+
+def collapse_loops(text: str, keep: int = 2, min_repeats: int = _LOOP_MIN_REPEATS) -> tuple[str, bool]:
+    """Cut a runaway decoder loop ("black on black on black on …").
+
+    Spoken hooks repeated 2–3 times are kept. Only a word n-gram that repeats
+    `min_repeats`+ times back-to-back is collapsed to `keep` copies. Returns
+    (text, looped).
+    """
+    words = (text or "").split()
+    n = len(words)
+    if n < min_repeats:
+        return text or "", False
+    norm = [_loop_norm(w) for w in words]
+    out: list[str] = []
+    looped = False
+    i = 0
+    while i < n:
+        best_len = 0
+        best_reps = 0
+        max_len = min(_LOOP_MAX_NGRAM, (n - i) // min_repeats)
+        for length in range(1, max_len + 1):
+            unit = norm[i : i + length]
+            if not any(unit):
+                continue
+            reps = 1
+            j = i + length
+            while j + length <= n and norm[j : j + length] == unit:
+                reps += 1
+                j += length
+            need = max(min_repeats, _LOOP_MIN_REPEATS_1GRAM) if length == 1 else min_repeats
+            if reps >= need and reps * length > best_reps * best_len:
+                best_len, best_reps = length, reps
+        if best_len:
+            out.extend(words[i : i + best_len * keep])
+            i += best_len * best_reps
+            looped = True
+        else:
+            out.append(words[i])
+            i += 1
+    return " ".join(out), looped
+
+
 def _in_order_word_matches(prev_words: list[str], new_words: list[str]) -> int:
     """Count prev words that appear in order in new (greedy subsequence)."""
     matched = 0
